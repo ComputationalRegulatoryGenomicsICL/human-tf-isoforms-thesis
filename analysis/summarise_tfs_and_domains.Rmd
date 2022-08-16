@@ -1,0 +1,375 @@
+---
+title: "Summarise human TFs and their domains"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    collapsed: no
+    fig_align: center
+    fig_caption: yes
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r, include=T}
+stringsAsFactors = F
+
+library(tidyverse)
+library(kableExtra)
+library(biomaRt)
+library(R.utils)
+```
+
+# Print package versions
+
+Print versions of the loaded libraries:
+
+```{r, include=T}
+R.version
+packageVersion("base")
+packageVersion("tidyverse")
+packageVersion("kableExtra")
+packageVersion("biomaRt")
+packageVersion("R.utils")
+```
+
+# Read input
+
+Read args:
+
+```{r, include=T}
+args = commandArgs()
+
+humantfs_name = args[9]
+interpro_entries_name = args[10]
+ensg_enst_ensp_name = args[11]
+gene_biotype_table_name = args[12]
+protein_fasta_tfs_name = args[13]
+```
+
+# Retrieve and count all human TFs from the HumanTFs database
+
+First, retrieve all transcription factors from the [Human Transcription Factors](http://humantfs.ccbr.utoronto.ca/index.php) database ([Lambert et al., 2018](https://www.sciencedirect.com/science/article/pii/S0092867418301065?via%3Dihub)):
+
+```{r, include=T}
+humantfs = as_tibble(read.csv(file = gunzip(humantfs_name), 
+                              header = T, 
+                              row.names = 1))
+```
+
+Rename families: "CxxC" into "CxxC ZF" and "CxxC; AT hook" into "CxxC ZF; AT hook" - to unify them with the "CxxC ZF; MBD" family.
+
+```{r, include=T}
+humantfs = humantfs %>%
+  mutate(DBD = ifelse(DBD == "CxxC", "CxxC ZF", as.character(DBD))) %>%
+  mutate(DBD = ifelse(DBD == "CxxC; AT hook", "CxxC ZF; AT hook", as.character(DBD)))
+```
+
+Overall, [Lambert et al., 2018](https://www.sciencedirect.com/science/article/pii/S0092867418301065?via%3Dihub) consider `r nrow(humantfs)` proteins, of which `r nrow(humantfs %>% filter(Is.TF. == "Yes"))` they classify as transcription factors. `r nrow(humantfs %>% filter(Is.TF. == "Yes" & DBD != "Unknown"))` of the transcription factors have a known DBD.
+
+Let's consider all `r nrow(humantfs %>% filter(Is.TF. == "Yes"))` transcription factors. Here is a snippet of the HumanTFs table:
+
+```{r, include=T}
+tfs = humantfs %>% 
+  filter(Is.TF. == "Yes")
+
+kable(tfs[1:6,]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+This table contains `r nrow(humantfs %>% filter(Is.TF. == "Yes"))` human TFs.
+
+```{r, include=T}
+humantfs_dbd_ids = c()
+
+for (record in (tfs %>% dplyr::select(Interpro.ID.s.))) {
+  humantfs_dbd_ids = c(humantfs_dbd_ids, unlist(str_split(record, ";")))
+}
+
+humantfs_dbd_ids = unique(humantfs_dbd_ids[humantfs_dbd_ids != "" &
+                                           humantfs_dbd_ids != "None"])
+```
+
+The "Interpro.ID.s." column of this table contains InterPro IDs of various domains in these TFs ([HumanTFs README](http://humantfs.ccbr.utoronto.ca/download/v_1.01/Readme_TFs_v_1.01.txt) erroniously claims that this column contains IDs of DBDs only, but from the comparison of these IDs to the domain IDs from HumanTFs web pages for individual TFs it is evident that this column contains not only DBD IDs). These IDs total to `r length(humantfs_dbd_ids)`.
+
+Plot the TF abundance:
+
+```{r, include=T, fig.width=15, fig.height=10}
+tfs %>%
+  dplyr::count(DBD) %>%
+  mutate(DBD = fct_reorder(DBD, dplyr::desc(n))) %>%
+  ggplot(aes(x = DBD, y = n)) +
+    geom_col(fill = "red") +
+    scale_y_continuous(breaks = seq(0, 800, 100)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 14),
+          axis.text.y = element_text(size = 14)) +
+    theme(axis.title = element_text(size = 16))
+```
+
+Only top 10 families:
+
+```{r, include=T}
+tfs %>%
+  dplyr::count(DBD) %>%
+  mutate(DBD = fct_reorder(DBD, dplyr::desc(n))) %>%
+  arrange(dplyr::desc(n)) %>%
+  head(10) %>%
+  ggplot(aes(x = DBD, y = n)) +
+    geom_col(fill = "red") +
+    scale_y_continuous(breaks = seq(0, 800, 100)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 14),
+          axis.text.y = element_text(size = 14)) +
+    theme(axis.title = element_text(size = 16))
+```
+
+The five most abundant TF families are C2H2 ZF (`r nrow(tfs %>% filter(DBD == "C2H2 ZF"))`), Homeodomain (`r nrow(tfs %>% filter(DBD == "Homeodomain"))`), bHLH (`r nrow(tfs %>% filter(DBD == "bHLH"))`), TFs with unknown DBD (`r nrow(tfs %>% filter(DBD == "Unknown"))`), and bZIP (`r nrow(tfs %>% filter(DBD == "bZIP"))`), which corresponds very well to the histograms shown in [Lambert et al., 2018](https://www.sciencedirect.com/science/article/pii/S0092867418301065?via%3Dihub), Fig. 1B.
+
+# Investigate InterPro entries from HumanTFs
+
+Read in all records from the InterPro database v77.0 (14/11/2019):
+
+```{r, include=T}
+interpro_entries = read.delim(gunzip(interpro_entries_name))
+```
+
+Some InterPro entries used in HumanTFs were removed from InterPro v77 which is used in this analysis:
+
+```{r, include=T}
+kable(humantfs_dbd_ids[!humantfs_dbd_ids %in% (interpro_entries %>% pull(ENTRY_AC))]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+According to the InterPro helpdesk, signatures from the removed InterPro entries are removed themselves or integrated into other InterPro accessions. So, let us edit the list of DBD InterPro accessions according to the information from the helpdesk:
+
+```{r, include=T}
+# Drop the accessions that were removed from the database without re-assignment
+humantfs_dbd_ids = humantfs_dbd_ids[!humantfs_dbd_ids %in% c("IPR016608", "IPR003068", "IPR029780")]
+
+# Replace the other invalid InterPro accessions with the ones where individual signatures were re-integrated
+humantfs_dbd_ids = humantfs_dbd_ids[!humantfs_dbd_ids %in% c("IPR007087", "IPR013110", "IPR020478", "IPR021129",
+                                                             "IPR013999", "IPR015880", "IPR013069", "IPR013723",
+                                                             "IPR004022", "IPR018500", "IPR003606", "IPR008946",
+                                                             "IPR011510", "IPR011038", "IPR006055")]
+
+humantfs_dbd_ids = c(humantfs_dbd_ids, "IPR013087", "IPR025789", "IPR017956", "IPR001660",
+                                       "IPR014012", "IPR013087", "IPR041661", "IPR000210",
+                                       "IPR003652", "IPR018501", "IPR018501", "IPR007728",
+                                       "IPR035500", "IPR001660", "IPR012674", "IPR013520")
+
+# Take unique entries, in case some of the added ones were already present
+humantfs_dbd_ids = unique(humantfs_dbd_ids)
+```
+
+Now, the list of InterPro entries from HumanTFs contains `r length(humantfs_dbd_ids)` elements. Select only valid InterPro entries from the table of all HumanTFs InterPro entries:
+
+```{r, include=T}
+dbd_ipr_humantfs = interpro_entries %>%
+  filter(ENTRY_AC %in% humantfs_dbd_ids)
+```
+
+Here is a snippet of the filtered table:
+
+```{r, include=T}
+kable(head(dbd_ipr_humantfs)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+# Investigate transcription factors from HumanTFs in Ensembl v99
+
+Parse the whole human Ensembl 99 annotation:
+
+```{r, include=T}
+ensg_enst_ensp = read.delim(gunzip(ensg_enst_ensp_name))
+```
+
+This annotation was obtained using the following code:
+
+```{r, include=T, eval=F}
+# Not executed
+ensembl = useEnsembl(biomart = "ensembl",
+                     dataset = "hsapiens_gene_ensembl",
+                     version = "99")
+
+ensg_enst_ensp = getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "ensembl_peptide_id"),
+                       filters = "transcript_biotype",
+                       values = "protein_coding",
+                       mart = ensembl)
+
+write.table(ensg_enst_ensp, 
+            file = "ensg_enst_ensp_99.tsv", 
+            quote = F, 
+            sep = "\t", 
+            row.names = F)
+```
+
+The annotation contains `r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_gene_id) %>% unique() %>% length()` TF genes from the HumanTFs database and `r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_transcript_id) %>% unique() %>% length()` coding TF transcripts. So `r tfs %>% pull(Ensembl.ID) %>% unique() %>% length() - ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_gene_id) %>% unique() %>% length()` TFs from HumanTFs do not have coding transcripts in Ensembl 99:
+
+```{r, include=T}
+kable(tfs[!tfs$Ensembl.ID %in% (ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_gene_id) %>% unique()), "Ensembl.ID"]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+`DUX1_HUMAN` and `DUX3_HUMAN` are UniProt accessions that do not have any corresponding genes in Ensebml v99, while the other three genes are
+
+```{r, include=T}
+gene_biotype_table = read.delim(gene_biotype_table_name)
+
+kable(gene_biotype_table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+and so they are filtered out either.
+
+The table of biotypes of the selected genes was generated with the following code:
+
+```{r, include=T, eval=F}
+# Not executed
+ensembl = useEnsembl(biomart = "ensembl",
+                     dataset = "hsapiens_gene_ensembl",
+                     version = "99")
+
+gene_biotype_table = getBM(attributes = "gene_biotype", 
+                           filters = "ensembl_gene_id", 
+                           values = c("ENSG00000249459", "ENSG00000214189", "ENSG00000228623"), 
+                           mart = ensembl)
+
+write.table(gene_biotype_table, 
+            file = "gene_biotype_table_99_selected.tsv", 
+            quote = F, 
+            sep = "\t", 
+            row.names = F)
+```
+
+# Investigate domain matches in TF protein products from Ensembl v99
+
+The following table contains all domain matches with InterPro entry IDs in TF protein products annotated in Ensembl 99. The matches were obtained using InterProScan v5.39-77.0:
+
+```{r, include=T}
+ips_domains_ipr_ens99 = read.delim(file = gunzip(protein_fasta_tfs_name), 
+                                   header = F, 
+                                   row.names = NULL, 
+                                   col.names = c("protein_accession", "seq_md5", "seq_len", 
+                                                 "db", "domain_accession", "domain_description",
+                                                 "start", "stop", "evalue",
+                                                 "status", "run_date", "ipr_accession",
+                                                 "ipr_description", "go_terms", "pathways")) %>%
+  as_tibble() %>%
+  filter(!is.na(ipr_accession) & (ipr_accession != "")) %>%
+  mutate(protein_accession = str_extract(protein_accession, "[A-Z0-9]+")) %>%
+  left_join(ensg_enst_ensp, by = c("protein_accession" = "ensembl_peptide_id"))
+```
+
+Here we do not filter matches by e-value, because:
+
+- e-values of signatures from different databases are not comparable;
+
+- some databases can use criteria other than e-value to report matches (see InterProScan developer's comment: https://github.com/ebi-pf-team/interproscan/issues/9).
+
+We consider a match valid if its signature has an InterPro accession ID.
+
+The table contains `r nrow(ips_domains_ipr_ens99)` records for `r ips_domains_ipr_ens99 %>% pull(ensembl_transcript_id) %>% unique() %>% length()` transcripts from `r ips_domains_ipr_ens99 %>% pull(ensembl_gene_id) %>% unique() %>% length()` genes. So, `r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_transcript_id) %>% unique() %>% length() - ips_domains_ipr_ens99 %>% pull(ensembl_transcript_id) %>% unique() %>% length()` transcripts and `r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_gene_id) %>% unique() %>% length() - ips_domains_ipr_ens99 %>% pull(ensembl_gene_id) %>% unique() %>% length()` genes do not have any matches. The two genes are:
+
+```{r, include=T}
+genes_overall = ensg_enst_ensp %>% 
+    filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% 
+    pull(ensembl_gene_id) %>% 
+    unique()
+
+genes_with_matches = ips_domains_ipr_ens99 %>% 
+    pull(ensembl_gene_id) %>% 
+    unique()
+
+kable(tfs %>% 
+    filter(Ensembl.ID %in% genes_overall[!genes_overall %in% genes_with_matches]) %>% 
+    dplyr::select(Ensembl.ID, HGNC.symbol)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+According to HumanTFs, NFE4 does not posses a DBD and is included in the Unknown family. It has no evidence from previous annotations of being a TF. ZNF365 is included in the C2H2 ZF family and has some evidence of being a TF from previous annotations, but its isoforms do not show a C2H2 ZF domain. Overall, these two proteins indeed do not have strong evidence of being TFs, and so we exclude them from the analysis.
+
+The bar-chart below shows the numbers of matches with coordinates from different databases (one InterPro entry can correspond to signatures from several databases):
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99 %>%
+  dplyr::select(db) %>%
+  ggplot(aes(x = db)) +
+    geom_bar(aes(fill = db)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 30000)) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ips_domains_ipr_ens99_iprs = ips_domains_ipr_ens99 %>% 
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+Overall, there are `r nrow(ips_domains_ipr_ens99)` signatures from `r ips_domains_ipr_ens99 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches (InterPro entries). In the scanning results, we have `r length(ips_domains_ipr_ens99_iprs)` different InterPro entries, `r length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids])` of which are present in HumanTFs (and consequently, `r length(ips_domains_ipr_ens99_iprs) - length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids])` of all different InterPro entries are not present there). Hence, `r length(humantfs_dbd_ids) - length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs were not found in the scanning process:
+
+```{r, include=T}
+kable(dbd_ipr_humantfs[!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_iprs,]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Write down tables for downstream modules:
+
+```{r, include=T}
+saveRDS(ips_domains_ipr_ens99,
+        file = "ips_domains_ipr_ens99.rds")
+
+saveRDS(humantfs_dbd_ids,
+        file = "humantfs_dbd_ids.rds")
+
+saveRDS(ips_domains_ipr_ens99_iprs,
+        file = "ips_domains_ipr_ens99_iprs.rds")
+
+saveRDS(dbd_ipr_humantfs,
+        file = "dbd_ipr_humantfs.rds")
+
+saveRDS(tfs,
+        file = "tfs.rds")
+
+write.table(ips_domains_ipr_ens99,
+            file = "ips_domains_ipr_ens99.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+write.table(humantfs_dbd_ids,
+            file = "humantfs_dbd_ids.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+write.table(ips_domains_ipr_ens99_iprs,
+            file = "ips_domains_ipr_ens99_iprs.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+write.table(dbd_ipr_humantfs,
+            file = "dbd_ipr_humantfs.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+            
+write.table(tfs,
+            file = "tfs.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```

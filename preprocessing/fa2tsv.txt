@@ -1,0 +1,2 @@
+<Homo_sapiens.GRCh38.pep.all.99.fa awk -F"." '{if ($1 ~ /^>/) {if (NR != 1) {printf "\n"}; printf $1 "\t"} else {printf $0}} END {printf "\n"}' | tr -d '>' > Homo_sapiens.GRCh38.pep.all.99.tsv
+

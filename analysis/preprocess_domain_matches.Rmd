@@ -1,0 +1,2900 @@
+---
+title: "Preprocess domain matches in TF isoforms"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    collapsed: no
+    fig_align: center
+    fig_caption: yes
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r, include=T}
+stringsAsFactors = F
+
+library(tidyverse)
+library(kableExtra)
+library(yaml)
+library(data.tree)
+library(XLConnect)
+library(R.utils)
+```
+
+# Print package versions
+
+Print versions of the loaded libraries:
+
+```{r, include=T}
+R.version
+packageVersion("base")
+packageVersion("tidyverse")
+packageVersion("kableExtra")
+packageVersion("yaml")
+packageVersion("data.tree")
+packageVersion("XLConnect")
+packageVersion("R.utils")
+```
+
+# Read input
+
+Read args:
+
+```{r, include=T}
+args = commandArgs()
+
+interpro_entries_name = args[9]
+ips_domains_ipr_ens99_name = args[10]
+ipr_hierarchy_yaml_name = args[11]
+humantfs_dbd_ids_name = args[12]
+ips_domains_ipr_ens99_iprs_name = args[13]
+dbd_ipr_humantfs_name = args[14]
+ensg_enst_ensp_name = args[15]
+tfs_name = args[16]
+draft_classification_table_name = args[17]
+domain_classification_wb_name = args[18]
+```
+
+# Prepare for the filtering of matches in TF protein products from Ensembl v99
+
+InterPro has entries of 5 different types (information on each type is taken from [InterPro entry types](https://www.ebi.ac.uk/training/online/course/interpro-functional-and-structural-analysis-protei/what-interpro-entry/interpro-entry-types)):
+
+* __Homologous Superfamily__ usually include proteins with a certain tertiary structure. Homologous Superfamilies are always composed of CATH-Gene3D and/or SUPERFAMILY signatures. Homologous Superfamily entries do not form hierarchies.
+
+* __Protein Family__ contains proteins with a common ancestor. Families are organized in hierarchies.
+
+* __Domain__ is a separable structural or functional part of a protein. They can form hierarchies.
+
+* __Site__ is a small locus in a protein (typically, only several residues long) that may affect the protein's function. Sites do not form hierarchies. InterPro includes the following types of Sites:
+
+    - __active sites__ contain residues with catalytic activity;
+
+    - __binding sites__ contain residues that bind molecules or ions;
+  
+    - __post-translation modification (PTM) sites__ contain residues that can be chemically modified after translation;
+  
+    - __conserved sites__ are loci of an unknown function that are found in certain types of proteins.
+
+* __Repeat__ is a short sequence repeated in a protein. It may facilitate binding or other characteristics. Repeats do not form hierarchies.
+
+"Hierarchical relationships are identified between evolutionarily related InterPro entries, tracing those that represent smaller, functionally specific subfamilies of larger families, or subclasses of broader classes of domain" [Mitchell et al., 2018](https://academic.oup.com/nar/article/47/D1/D351/5162469).
+
+Hence, we will need to hierarchically filter InterPro entries, prioritizing domains.
+
+The numbers of matches (InterPro entries) of different types in TF protein isoforms:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99 = readRDS(ips_domains_ipr_ens99_name)
+
+interpro_entries = read.delim(gunzip(interpro_entries_name))
+
+ips_domains_ipr_ens99 %>%
+  left_join(interpro_entries, by = c("ipr_accession" = "ENTRY_AC")) %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() + 
+    theme(legend.position = "none")
+```
+
+Overall, there are `r ips_domains_ipr_ens99 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches (InterPro entries) in TF protein isoforms. The most part of the entries are of the Domain and Homologous Superfamily types.
+
+Furthermore, several signatures can colocalize in one InterPro entry. The plot below shows all signature combinations contained in matches:
+
+```{r, include=T, fig.width=10}
+db_intersections = as.data.frame(table(unlist(group_map(ips_domains_ipr_ens99 %>%
+                                                group_by(ensembl_transcript_id, ipr_accession) %>%
+                                                arrange(db),
+                                              ~ paste(unique(.x %>% pull(db)), collapse = "_")))))
+
+db_intersections %>%
+  mutate(database_combination = Var1) %>%
+  mutate(count = Freq) %>%
+  arrange(dplyr::desc(count)) %>%
+  mutate(database_combination = factor(database_combination, levels = database_combination)) %>%
+  ggplot(aes(x = database_combination, y = count)) +
+    geom_col(fill = "red") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Hence, in general, for each InterPro entry we will need to select one signature out of several.
+
+# Filter matches in TF protein products from Ensembl v99
+
+## Calculate integrated coordinates
+
+First, for each InterPro entry from the scanning results, calculate its integrated coordinates:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_raw = ips_domains_ipr_ens99 %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  mutate(int_start = min(start)) %>%
+  mutate(int_stop = max(stop)) %>%
+  ungroup()
+```
+
+Next, obtain the lists of databases whose signatures comprise different types of InterPro entries:
+
+Active sites:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Active_site") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Binding sites:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Binding_site") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Conserved sites:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Conserved_site") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Domains:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Domain") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Families:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Family") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Homologous Superfamilies:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Homologous_superfamily") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Repeats:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99 %>%
+        mutate(ipr_accession = as.character(ipr_accession)) %>%
+        left_join(interpro_entries %>% mutate(ENTRY_AC = as.character(ENTRY_AC)), 
+                  by = c("ipr_accession" = "ENTRY_AC")) %>%
+        mutate(db = as.character(db)) %>%
+        filter(ENTRY_TYPE == "Repeat") %>%
+        pull(db) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+As we saw above, some InterPro entries of the type Family have not only PIRSF or PANTHER signatures (which usually span the whole protein) but also domain-type signatures (Pfam, SMART, ProSiteProfiles, CDD, TIGRFAM, Hamap).
+
+I consider Hamap signatures to be domains, because, although Hamap is a database of protein families, it has detailed annotation rules for each family which include possible presence of certain domains ([Pedruzzi et al., 2015](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4383873/)); so, Hamap matches might designate domains as well.
+
+Consequently, it is better to re-calculate the integrated coordinates of such Family entries excluding PIRSF and PANTHER signatures, so the new integrated coordinates reflect actual domains:
+
+```{r, include=T}
+calc_new_int_coords = function(start, stop, int_start, int_stop, db) {
+  all_matches = data.frame(start = start,
+                           stop = stop,
+                           db = as.character(db))
+
+  domain_matches = all_matches %>%
+    filter((db != "PIRSF") & (db != "PANTHER"))
+
+  domain_matches_n = domain_matches %>%
+     nrow()
+
+  if (domain_matches_n == 0) {
+    return(paste0(as.character(int_start), "_", as.character(int_stop)))
+  }
+
+  new_int_start = min(domain_matches$start)
+
+  new_int_stop = max(domain_matches$stop)
+
+  return(paste0(as.character(new_int_start), "_", as.character(new_int_stop)))
+}
+
+ips_domains_ipr_ens99_int_fam = ips_domains_ipr_ens99_int_raw %>%
+  left_join(interpro_entries, by = c("ipr_accession" = "ENTRY_AC")) %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(mutate(., new_int_coords = calc_new_int_coords(.$start, .$stop, .$int_start[1], .$int_stop[1], .$db))) %>%
+  do(mutate(., int_start = as.numeric(unlist(str_split(.$new_int_coords, "_"))[1]))) %>%
+  do(mutate(., int_stop = as.numeric(unlist(str_split(.$new_int_coords, "_"))[2]))) %>%
+  ungroup() %>%
+  dplyr::select(-c("new_int_coords", "ENTRY_NAME"))
+
+ips_domains_ipr_ens99_int = ips_domains_ipr_ens99_int_raw %>%
+  left_join(interpro_entries, by = c("ipr_accession" = "ENTRY_AC")) %>%
+  dplyr::select(-ENTRY_NAME) %>%
+  filter(ENTRY_TYPE != "Family") %>%
+  bind_rows(ips_domains_ipr_ens99_int_fam)
+```
+
+## Find specific and general InterPro entries
+
+In the scanning results, analyse Domain and Family entries which form hierarchies:
+
+* Mark the most specific entries.
+
+* For each entry that is a part of the Domain or Family hierarchy, store the ancestral InterPro entry, if any.
+
+The hierarchy of InterPro v77 entries was obtained from the InterPro website (https://www.ebi.ac.uk/interpro/download/) as a TXT file, when v77 was the latest one, and then converted into YAML with custom scripts.
+
+```{r, include=T}
+find_ipr_ancestor = function(ipr_hierarchy, ipr_node, ipr_accessions_unique) {
+  ancestors = Traverse(ipr_node, traversal = "ancestor")
+
+  for (ancestor in ancestors) {
+    if (ancestor$name %in% ipr_accessions_unique[ipr_accessions_unique != ipr_node$name]) {
+      return(ancestor$name)
+    }
+  }
+
+  return("")
+}
+
+calc_domain_status = function(ipr_hierarchy, ipr_accessions) {
+  ipr_accessions_unique = unique(ipr_accessions)
+
+  domain_statuses = data.frame(ipr = ipr_accessions_unique,
+                               ipr_status = rep("specific", length(ipr_accessions_unique)),
+                               ipr_ancestor = rep(NA, length(ipr_accessions_unique))) %>%
+    mutate(ipr = as.character(ipr)) %>%
+    mutate(ipr_status = as.character(ipr_status)) %>%
+    mutate(ipr_ancestor = as.character(ipr_ancestor))
+
+  for (ipr in ipr_accessions_unique) {
+    ipr_node = FindNode(ipr_hierarchy, ipr)
+
+    if (!is.null(ipr_node)) {
+      ipr_ancestor_name = find_ipr_ancestor(ipr_hierarchy, ipr_node, ipr_accessions_unique)
+
+      if (ipr_ancestor_name != "") {
+        domain_statuses[domain_statuses$ipr == ipr_ancestor_name, "ipr_status"] = "general"
+
+        domain_statuses[domain_statuses$ipr == ipr, "ipr_ancestor"] = ipr_ancestor_name
+      }
+    }
+  }
+
+  return(domain_statuses)
+}
+
+ipr_hierarchy_yaml = read_yaml(file = ipr_hierarchy_yaml_name)
+
+ipr_hierarchy = as.Node(ipr_hierarchy_yaml)
+
+ips_domains_ipr_ens99_int = ips_domains_ipr_ens99_int %>%
+  mutate(ipr_accession = as.character(ipr_accession))
+
+ips_domains_ipr_ens99_int_specific_retained = ips_domains_ipr_ens99_int %>%
+  group_by(ensembl_transcript_id) %>%
+  do(left_join(., calc_domain_status(ipr_hierarchy, .$ipr_accession), by = c("ipr_accession" = "ipr")))
+
+ips_domains_ipr_ens99_int_specific_retained_iprs = ips_domains_ipr_ens99_int_specific_retained %>% 
+  filter(ipr_status == "specific") %>% 
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+Load `humantfs_dbd_ids` and `ips_domains_ipr_ens99_iprs`:
+
+```{r, include=T}
+humantfs_dbd_ids = readRDS(humantfs_dbd_ids_name)
+ips_domains_ipr_ens99_iprs = readRDS(ips_domains_ipr_ens99_iprs_name)
+```
+
+Now we have `r ips_domains_ipr_ens99_int_specific_retained_iprs %>% length()` unique specific InterPro entries out of `r ips_domains_ipr_ens99_iprs %>% length()` we had after scanning (specific and general together). So, almost all matches are specific. `r length(ips_domains_ipr_ens99_int_specific_retained_iprs[ips_domains_ipr_ens99_int_specific_retained_iprs %in% humantfs_dbd_ids])` of these entries are from HumanTFs. The following `r length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained_iprs[ips_domains_ipr_ens99_int_specific_retained_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs are general:
+
+```{r, include=T}
+dbd_ipr_humantfs = readRDS(dbd_ipr_humantfs_name)
+
+kable(dbd_ipr_humantfs[(dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_iprs) & (!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained_iprs),]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are now `r nrow(ips_domains_ipr_ens99_int_specific_retained)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained %>% filter(ipr_status == "general"))` are under general matches.
+
+Overall, there are `r ips_domains_ipr_ens99_int_specific_retained %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches, of which `r ips_domains_ipr_ens99_int_specific_retained %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are specific and `r ips_domains_ipr_ens99_int_specific_retained %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are general. The number of matched transcripts is `r ips_domains_ipr_ens99_int_specific_retained %>% pull(ensembl_transcript_id) %>% unique() %>% length()`. It did not change from the previous step, which is correct.
+
+The numbers of specific InterPro entries of different types are shown below:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained %>%
+  filter(ipr_status == "specific") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() + 
+    theme(legend.position = "none")
+```
+
+Only Domain and Family bars lowered, which is correct, as only domains and families comprise hierarchies in InterPro.
+
+## Check overlaps between matches of the type Domain
+
+Check if we have overlapping specific domain InterPro entries (overlaps are calculated from integrated coordinates):
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        overlaps = c(overlaps, T)
+
+        overlap_detected = T
+
+        break
+      }
+    }
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained_overlapping.dom = ips_domains_ipr_ens99_int_specific_retained %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ipr_status == "specific") %>%
+  filter(ENTRY_TYPE == "Domain") %>%
+  dplyr::select(ensembl_transcript_id, ipr_accession, int_start, int_stop) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop))) %>%
+  filter(overlaps == T) %>%
+  ungroup()
+
+tr.with.overlapping.domains.count = ips_domains_ipr_ens99_int_specific_retained_overlapping.dom %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+```
+
+Load `ensg_enst_ensp` and `tfs`:
+
+```{r, include=T}
+ensg_enst_ensp = read.delim(gunzip(ensg_enst_ensp_name))
+tfs = readRDS(tfs_name)
+```
+
+We have `r nrow(ips_domains_ipr_ens99_int_specific_retained_overlapping.dom)` overlapping specific domains (so they are not in hierarchical relationship in InterPro)! They are located in `r tr.with.overlapping.domains.count` transcripts out of the total number of transcripts (`r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`). Let us retain them at present, as they can have different meaning. For example, 
+
+* In NFE2L3-201 (ENST00000056233), IPR004827 and IPR004826 probably denote a more general and a more specific type of domain (bZIP and bZIP-Maf, respectively).
+
+* In YBX2-201 (ENST00000007699), IPR002059 and IPR019844 most probably denote the whole domain (CSP_DNA-bd) and its part (CSD-1), respectively.
+
+* In TRPS1-201 (ENST00000220888), IPR013087 denotes a C2H2-ZF array, while IPR000679 defines a Znf-GATA domain inside the array, not intersecting with C2H2 domains.
+
+* In SMYD3-214 (ENST00000490107), IPR001214 denotes a SET domain, while IPR002893 denotes a zinc finger MYND domain embedded into a SET domain.
+
+* In ZNF426-201 (ENST00000253115), IPR013087 denotes a C2H2 zinc finger array, while IPR003656 defines two BED domains overlapping with the C2H2 zinc fingers.
+
+* In MYF6-201 (ENST00000228641), IPR002546 defines a "Basic" domain and slightly overlaps with IPR011598 which defines a bHLH domain.
+
+Consequently, it is not possible to have a general rule to select a domain from a number of overlaping InterPro accessions, and so we will not filter such domain InterPro accessions at present.
+
+## Filter all matches against Domain matches
+
+Next, let us filter out all matches (InterPro entries) intersecting domain matches:
+
+```{r, include=T}
+outside_domains = function(int_start, int_stop, ipr_type, i, ipr_status) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_status = ipr_status)
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  domain_matches = all_matches %>%
+    filter(ipr_type == "Domain") %>%
+    filter(ipr_status == "specific")
+
+  for (j in 1:nrow(domain_matches)) {
+    j_start = domain_matches[j, "int_start"]
+
+    j_stop = domain_matches[j, "int_stop"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(F)
+    }
+  }
+
+  return(T)
+}
+
+calc_retained_iprs = function(int_start, int_stop, ipr_type, ipr_status) {
+  retain_ipr = c()
+
+  if (!"Domain" %in% ipr_type) {
+    return(rep(T, length(int_start)))
+  }
+
+  for (i in 1:length(int_start)) {
+    if (ipr_type[i] != "Domain") {
+      retain_ipr = c(retain_ipr, outside_domains(int_start, int_stop, ipr_type, i, ipr_status))
+    } else {
+      retain_ipr = c(retain_ipr, T)
+    }
+  }
+
+  return(retain_ipr)
+}
+
+ips_domains_ipr_ens99_int_specific_retained1 = ips_domains_ipr_ens99_int_specific_retained %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., retain_ipr = calc_retained_iprs(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_status))) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained1 = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(retain_ipr == T)
+
+ips_domains_ipr_ens99_int_specific_retained1_iprs = ips_domains_ipr_ens99_int_specific_retained1 %>% 
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+Now we have `r ips_domains_ipr_ens99_int_specific_retained1_iprs %>% length()` unique specific InterPro entries out of `r ips_domains_ipr_ens99_int_specific_retained_iprs %>% length()` specific ones we had on the previous step. `r length(ips_domains_ipr_ens99_int_specific_retained1_iprs[ips_domains_ipr_ens99_int_specific_retained1_iprs %in% humantfs_dbd_ids])` of the retained specific entries are from HumanTFs. Hence, we lost the following `r length(ips_domains_ipr_ens99_int_specific_retained_iprs[ips_domains_ipr_ens99_int_specific_retained_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained1_iprs[ips_domains_ipr_ens99_int_specific_retained1_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs:
+
+```{r, include=T}
+kable(dbd_ipr_humantfs[(dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained_iprs) & (!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained1_iprs),]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are now `r nrow(ips_domains_ipr_ens99_int_specific_retained1)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "general"))` are under general matches.
+
+Check how many specific InterPro entries of different types we have now:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ipr_status == "specific") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() + 
+    theme(legend.position = "none")
+```
+
+Overall, we now have `r ips_domains_ipr_ens99_int_specific_retained1 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches, from which `r ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are specific and `r ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are general. All non-domain types went down, which is expected. Homologous Superfamily and Family decreased dramatically.
+
+The number of matched transcripts did not change (`r ips_domains_ipr_ens99_int_specific_retained1 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`), which is correct.
+
+As we saw above, some Family InterPro entries contain domain signatures. Let us look at them closer:
+
+```{r, include=T}
+dom_family_iprs = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(filter(., ("Pfam" %in% db) | 
+               ("SMART" %in% db) | 
+               ("ProSiteProfiles" %in% db) |
+               ("CDD" %in% db) |
+               ("TIGRFAM" %in% db))) %>%
+  dplyr::select(ipr_accession) %>%
+  distinct() %>%
+  ungroup() %>%
+  pull(ipr_accession)
+
+dom_family_iprs_unique = dom_family_iprs %>%
+  unique()
+
+dom_family_tx_count = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  filter((db == "Pfam") | 
+         (db == "SMART") | 
+         (db == "ProSiteProfiles") |
+         (db == "CDD") |
+         (db == "TIGRFAM")) %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+```
+
+So we have `r length(dom_family_iprs_unique)` different InterPro entries (general and specific) of the type Family which have domain signatures. Overall, we have `r length(dom_family_iprs)` such InterPro entries (matches) in our scanning results (out of all `r length(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ENTRY_TYPE == "Family") %>% group_by(ensembl_transcript_id, ipr_accession) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))` Family matches, specific and general). The number of transcripts with these Family matches is `r dom_family_tx_count`. Consequently, our next step is to filter all remaining non-domain InterPro entries against these Family entries, because, effectively, they are domains.
+
+## Preprocess matches of the type Family that have domain signatures
+
+First, check if these entries have domain signatures in all transcripts where they are present:
+
+```{r, include=T}
+non_dom_family_iprs = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(filter(., (!"Pfam" %in% db) & 
+               (!"SMART" %in% db) & 
+               (!"ProSiteProfiles" %in% db) &
+               (!"CDD" %in% db) &
+               (!"TIGRFAM" %in% db))) %>%
+  dplyr::select(ipr_accession) %>%
+  distinct() %>%
+  ungroup() %>%
+  pull(ipr_accession)
+
+non_dom_family_iprs_unique = non_dom_family_iprs %>%
+  unique()
+
+kable(dom_family_iprs_unique[dom_family_iprs_unique %in% non_dom_family_iprs_unique]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+No, there are `r length(dom_family_iprs_unique[dom_family_iprs_unique %in% non_dom_family_iprs_unique])` Family InterPro entries which have domain signatures in some transcripts, but do not have them in some other transcripts. We need to account for this in further analysis.
+
+Secondly, let us change the type of the Family accessions with domain signatures from "Family" to "Domain_Family." It will simplify further analysis:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained1_domfam = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(filter(., ("Pfam" %in% db) | 
+               ("SMART" %in% db) | 
+               ("ProSiteProfiles" %in% db) |
+               ("CDD" %in% db) |
+               ("TIGRFAM" %in% db))) %>%
+  do(mutate(., ENTRY_TYPE = "Domain_Family"))
+
+ips_domains_ipr_ens99_int_specific_retained1_nondomfam = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(filter(., (!"Pfam" %in% db) & 
+               (!"SMART" %in% db) & 
+               (!"ProSiteProfiles" %in% db) &
+               (!"CDD" %in% db) &
+               (!"TIGRFAM" %in% db)))
+
+ips_domains_ipr_ens99_int_specific_retained1_nonfam = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE != "Family")
+
+ips_domains_ipr_ens99_int_specific_retained1 = ips_domains_ipr_ens99_int_specific_retained1_domfam %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained1_nondomfam) %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained1_nonfam)
+
+retained1_nrow_prev = nrow(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific"))
+
+ips_domains_ipr_ens99_int_specific_retained1_iprs = ips_domains_ipr_ens99_int_specific_retained1 %>% 
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>% 
+  unique()
+
+ips_domains_ipr_ens99_int_specific_retained1_iprs_prev = ips_domains_ipr_ens99_int_specific_retained1_iprs
+```
+
+Now we got `r nrow(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific"))` specific matches, which is correct, because it is the same as after the previous step. `r length(ips_domains_ipr_ens99_int_specific_retained1_iprs[ips_domains_ipr_ens99_int_specific_retained1_iprs %in% humantfs_dbd_ids])` of unique specific InterPro entries are from HumanTFs, which is correct because it matches the previous value. At this stage, we have `r length(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ENTRY_TYPE == "Domain_Family") %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id, ipr_accession) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))` specific and `r length(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ENTRY_TYPE == "Domain_Family") %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id, ipr_accession) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))` general Domain-Family entries. Overall, we have `r length(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ENTRY_TYPE == "Domain_Family") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))` Domain-Family entries, which is correct.
+
+Next, check if these Domain-Family InterPro entries overlap with any other entries (otherwise, we do not need to filter against them, and they would naturally be retained after all other filtering steps):
+
+```{r, include=T}
+calc_domfam_ipr = function(int_start, int_stop, ipr_type, i, ipr_accession) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_accession = ipr_accession) %>%
+    mutate(ipr_accession = as.character(ipr_accession))
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  domfam_matches = all_matches %>%
+    filter(ipr_type == "Domain_Family")
+
+  for (j in 1:nrow(domfam_matches)) {
+    j_start = domfam_matches[j, "int_start"]
+
+    j_stop = domfam_matches[j, "int_stop"]
+
+    j_ipr_accession = domfam_matches[j, "ipr_accession"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(j_ipr_accession)
+    }
+  }
+
+  return("None")
+}
+
+find_overlapping_domfam = function(int_start, int_stop, ipr_type, ipr_accession) {
+  overlapping_domfam = c()
+
+  if (!"Domain_Family" %in% ipr_type) {
+    return(rep("None", length(int_start)))
+  }
+
+  for (i in 1:length(int_start)) {
+    if ((ipr_type[i] != "Domain_Family") &
+        (ipr_type[i] != "Domain")) {
+      overlapping_domfam = c(overlapping_domfam, calc_domfam_ipr(int_start, int_stop, ipr_type, i, ipr_accession))
+    } else {
+      overlapping_domfam = c(overlapping_domfam, "None")
+    }
+  }
+
+  return(overlapping_domfam)
+}
+
+overlapping_domfams = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., domfam_overlap = find_overlapping_domfam(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_accession))) %>%
+  ungroup() %>%
+  filter(domfam_overlap != "None")
+```
+
+Print IDs of unique overlapping InterPro entries:
+
+```{r, include=T}
+overlapping_domfam_iprs_unique = overlapping_domfams %>% 
+  pull(domfam_overlap) %>% 
+  unique()
+
+kable(overlapping_domfam_iprs_unique) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, `r length(overlapping_domfam_iprs_unique)` unique Domain-Family InterPro entries overlap with entries of other types. Overall, we have `r overlapping_domfams %>% group_by(ensembl_transcript_id) %>% dplyr::select(domfam_overlap) %>% distinct() %>% ungroup() %>% pull(domfam_overlap) %>% length()` such Domain-Family entries. Hence, we do need to prioritise Domain-Family entries next and filter all remaining (non-Domain) entries against them.
+
+## Check overlaps between matches of the type Domain-Family
+
+First of all, let us check if there are overlaps between Domain-Family entries, and these overlaps, if any, are not just between general and corresponding specific entries (in which case we are not interested in them, as we are going to use only specific entries for filtering):
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        overlaps = c(overlaps, T)
+        overlap_detected = T
+        break
+      }
+    }
+
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained1_overlapping.df = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ENTRY_TYPE == "Domain_Family") %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id, ipr_accession, ipr_status, ipr_ancestor, int_start, int_stop) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop))) %>%
+  filter(overlaps == T)
+
+kable(ips_domains_ipr_ens99_int_specific_retained1_overlapping.df) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, all the overlaps are pairs of a general and a specific entry which is a child of the general one, and hence we do not need to do anything with them (we will keep both general and specific entries like we did with the Domain entries).
+
+Check if there are general Domain-Family entries not overlapping with any other Domain-Family entries:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained1_overlapping.df_iprs = ips_domains_ipr_ens99_int_specific_retained1_overlapping.df %>%
+  pull(ipr_accession) %>%
+  unique()
+
+dom_family_iprs_unique_single = dom_family_iprs_unique[!dom_family_iprs_unique %in% ips_domains_ipr_ens99_int_specific_retained1_overlapping.df_iprs]
+
+dom_family_iprs_unique_single_general = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Domain_Family") %>%
+  filter(ipr_accession %in% dom_family_iprs_unique_single) %>%
+  filter(ipr_status == "general") %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id, ipr_accession, ipr_status, ENTRY_TYPE) %>%
+  arrange(ensembl_gene_id, ensembl_transcript_id, ipr_accession) %>%
+  distinct()
+
+kable(dom_family_iprs_unique_single_general) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Yes, there are `r nrow(dom_family_iprs_unique_single_general)` cases where there is only one Domain-Family entry in a transcript, and it is general. We need to make these entries in these transcripts specific:
+
+```{r, include=T}
+dom_family_iprs_unique_single_general_to_specific = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter(ENTRY_TYPE == "Domain_Family") %>%
+  filter(ipr_accession %in% dom_family_iprs_unique_single) %>%
+  filter(ensembl_transcript_id %in% 
+           (dom_family_iprs_unique_single_general %>% 
+              pull(ensembl_transcript_id) %>%
+              unique())) %>%
+  filter(ipr_status == "general") %>%
+  mutate(ipr_status = "specific")
+
+dom_family_iprs_unique_other = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  filter((ENTRY_TYPE != "Domain_Family") |
+         (!ensembl_transcript_id %in% 
+           (dom_family_iprs_unique_single_general %>% 
+              pull(ensembl_transcript_id) %>%
+              unique())) |
+         (!ipr_accession %in% dom_family_iprs_unique_single) |
+         (ipr_status != "general"))
+
+ips_domains_ipr_ens99_int_specific_retained1 = dom_family_iprs_unique_single_general_to_specific %>%
+  bind_rows(dom_family_iprs_unique_other)
+
+ips_domains_ipr_ens99_int_specific_retained1_iprs = ips_domains_ipr_ens99_int_specific_retained1 %>% 
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+After the replacement we got `r nrow(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific"))` specific matches, which is correct, because we had `r retained1_nrow_prev` specific matches on the previous step, and now we got `r nrow(dom_family_iprs_unique_single_general_to_specific %>% filter(ipr_status == "specific"))` additional specific matches. Now we have `r length(ips_domains_ipr_ens99_int_specific_retained1_iprs[ips_domains_ipr_ens99_int_specific_retained1_iprs %in% humantfs_dbd_ids])` unique specific InterPro entries from HumanTFs, which is more than we had on the previous step. This is because now we have additional specific Domain-Family entries:
+
+```{r, include=T}
+additional_domfam_iprs = ips_domains_ipr_ens99_int_specific_retained1_iprs[!ips_domains_ipr_ens99_int_specific_retained1_iprs %in% ips_domains_ipr_ens99_int_specific_retained1_iprs_prev]
+kable(dbd_ipr_humantfs[dbd_ipr_humantfs$ENTRY_AC %in% additional_domfam_iprs,]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+The total number of unique specific InterPro entries also increased to `r ips_domains_ipr_ens99_int_specific_retained1_iprs %>% length()`.
+
+Overall, we have `r ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ENTRY_TYPE == "Domain_Family") %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` specific Domain-Family InterPro entries.
+
+## Filter all remaining matches against Domain-Family matches
+
+Now we are ready to filter all the remaining non-Domain InterPro entries against the specific Domain-Family ones:
+
+```{r, include=T}
+outside_df = function(int_start, int_stop, ipr_type, i, ipr_status) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_status = ipr_status)
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  df_matches = all_matches %>%
+    filter(ipr_type == "Domain_Family") %>%
+    filter(ipr_status == "specific")
+
+  for (j in 1:nrow(df_matches)) {
+    j_start = df_matches[j, "int_start"]
+
+    j_stop = df_matches[j, "int_stop"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(F)
+    }
+  }
+
+  return(T)
+}
+
+calc_retained_iprs = function(int_start, int_stop, ipr_type, ipr_status) {
+  if (!"Domain_Family" %in% ipr_type) {
+    return(rep(T, length(int_start)))
+  }
+
+  retain_ipr = c()
+
+  for (i in 1:length(int_start)) {
+    if ((ipr_type[i] != "Domain") & 
+        (ipr_type[i] != "Domain_Family")) {
+      retain_ipr = c(retain_ipr, outside_df(int_start, int_stop, ipr_type, i, ipr_status))
+    } else {
+      retain_ipr = c(retain_ipr, T)
+    }
+  }
+
+  return(retain_ipr)
+}
+
+ips_domains_ipr_ens99_int_specific_retained2 = ips_domains_ipr_ens99_int_specific_retained1 %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., retain_ipr = calc_retained_iprs(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_status))) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained2 = ips_domains_ipr_ens99_int_specific_retained2 %>%
+  filter(retain_ipr == T)
+
+ips_domains_ipr_ens99_int_specific_retained2_iprs = ips_domains_ipr_ens99_int_specific_retained2 %>% 
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+Now we have `r ips_domains_ipr_ens99_int_specific_retained2_iprs %>% length()` unique specific matches (InterPro entries) out of `r ips_domains_ipr_ens99_int_specific_retained1_iprs %>% length()` we had on the previous step. `r length(ips_domains_ipr_ens99_int_specific_retained2_iprs[ips_domains_ipr_ens99_int_specific_retained2_iprs %in% humantfs_dbd_ids])` of the retained specific entries are from HumanTFs. Hence, we lost the following `r length(ips_domains_ipr_ens99_int_specific_retained1_iprs[ips_domains_ipr_ens99_int_specific_retained1_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained2_iprs[ips_domains_ipr_ens99_int_specific_retained2_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs:
+
+```{r, include=T}
+kable(dbd_ipr_humantfs[(dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained1_iprs) & (!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained2_iprs),]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are now `r nrow(ips_domains_ipr_ens99_int_specific_retained2)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "general"))` are under general matches.
+
+Check how many specific InterPro entries of different types we have now:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained2 %>%
+  filter(ipr_status == "specific") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() + 
+    theme(legend.position = "none")
+```
+
+Active sites were removed completely. The number of binding sites did not change, while the number of conserved sites lowered considerably. Family entries subdivided into Family and Domain_Family. The number of Homologous Superfamily entries lowered considerably, while the number of Repeat entries did not change. The number of domains and domain-families did not change as well, which is correct. The number of families went down from `r length(ips_domains_ipr_ens99_int_specific_retained1 %>% filter(ipr_status == "specific") %>% filter(ENTRY_TYPE == "Family") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))` (the number of specific Family matches after the separation of Domain-Family matches but before the last filtering) to `r length(ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "specific") %>% filter(ENTRY_TYPE == "Family") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession))`.
+
+Overall, there are `r ips_domains_ipr_ens99_int_specific_retained2 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches, of which `r ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are specific and `r ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are general. The number of matched transcripts is `r ips_domains_ipr_ens99_int_specific_retained2 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`. It did not change from the previous step, which is correct.
+
+Next, let us prioritize Homologous Superfamily InterPro entries, as they also may represent domains (they mark loci with certain tertiary structures). 
+
+## Check overlaps between matches of the type Homologous Superfamily
+
+Check if we have overlapping InterPro entries among Homologous Superfamilies:
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        overlaps = c(overlaps, T)
+        overlap_detected = T
+        break
+      }
+    }
+
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf = ips_domains_ipr_ens99_int_specific_retained2 %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ENTRY_TYPE == "Homologous_superfamily") %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id, ipr_accession, ipr_description, int_start, int_stop) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop))) %>%
+  filter(overlaps == T)
+
+transcripts.with.overplapping.hs.count = ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+kable(ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Thus, we have `r nrow(ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf)` overlapping Homologous Superfamily entries in `r transcripts.with.overplapping.hs.count` transcripts out of the total number of transcripts (`r ensg_enst_ensp %>% filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`).
+
+Check how many Homologous Superfamily entries overlap in each transcript:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf %>%
+        mutate(n = n()) %>%
+        pull(n) %>%
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, overlapping Homologous Superfamily entries are in pairs. Check what pairs of InterPro entries they are:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf_pair.table = ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf %>%
+  do(arrange(., .$ipr_accession)) %>%
+  do(mutate(., ipr_pair = paste0(.$ipr_accession[1], " / ", .$ipr_accession[2]))) %>%
+  do(mutate(., description_pair = paste0(.$ipr_description[1], " / ", .$ipr_description[2]))) %>%
+  group_by(ipr_pair, description_pair) %>%
+  summarise(n = n()) %>%
+  arrange(n, dplyr::desc(n))
+
+kable(ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf_pair.table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+  
+So, there are only `r nrow(ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf_pair.table)` different pairs of InterPro entries. Let us decide what to do in each case: either select a more specific-looking entry (according to InterPro descriptions) or use another criterion, according to literature or other databases:
+
+1) __IPR011011 / IPR036427__ (Zinc finger, FYVE/PHD-type / Bromodomain-like superfamily): According to UniProt, a zinc-finger domain is indeed embedded into a bromodomain  ([SP140L](https://www.uniprot.org/uniprot/Q9H930#structure)). Consequently, I will keep both Homologous Superfamily entries.
+
+2) __IPR015943 / IPR036322__ (WD40/YVTN repeat-like-containing domain superfamily / WD40-repeat-containing domain superfamily): According to the descriptions in InterPro ([IPR015943](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR015943/) and [IPR036322](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR036322/)), IPR036322 can be more specific, so let us retain it.
+
+3) __IPR036388 / IPR036390__ (Winged helix-like DNA-binding domain superfamily / Winged helix DNA-binding domain superfamily): Retain a more specific-looking entry IPR036390 (it is not clear from the InterPro descriptions, [IPR036388](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR036388/) and [IPR036390](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR036390/), which one could be more specific).
+
+4) __IPR008967 / IPR012346__ (p53-like transcription factor, DNA-binding / p53/RUNT-type transcription factor, DNA-binding domain superfamily): Retain a more specific-looking entry IPR012346 (the other entry, IPR008967, takes part in some other pairs a well).
+
+5) __IPR008967 / IPR037095__ (p53-like transcription factor, DNA-binding / RBP-J/Cbf11/Cbf12, DNA binding domain superfamily): Retain a more specific-looking entry IPR037095.
+
+6) __IPR013783 / IPR014756__ (Immunoglobulin-like fold / Immunoglobulin E-set): According to the corresponding descriptions in InterPro ([IPR013783](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR013783/) and [IPR014756](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR014756/)), IPR014756 can be more specific, so let us retain it.
+
+7) __IPR011989 / IPR016024__ (Armadillo-like helical / Armadillo-type fold): From InterPro descriptions ([IPR011989](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR011989/) and [IPR016024](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR016024/)) it is not clear which entry is more specific. Let us use IPR016024 (Armadillo-type fold) as it is given by UniProt ([TERB1](https://www.uniprot.org/uniprot/Q8NA31#structure)) for a protein entry corresponding to a transcript that contains both of these entries.
+
+Now let us filter out the entries that we do not retain (we make them "general" in particular transcripts, where they overlap with Homologous Superfamily entries that we keep):
+
+```{r, include=T}
+specific.hs.number = ips_domains_ipr_ens99_int_specific_retained2 %>%
+  filter(ipr_status == "specific") %>%
+  filter(ENTRY_TYPE == "Homologous_superfamily") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession) %>%
+  distinct() %>%
+  ungroup() %>%
+  pull(ipr_accession) %>%
+  length()
+
+overlapping.sf.transcripts = ips_domains_ipr_ens99_int_specific_retained2_overlapping.sf$ensembl_transcript_id
+
+overlapping.sf.iprs.to.general = c("IPR015943", "IPR036388", "IPR008967", "IPR013783", "IPR011989")
+
+ips_domains_ipr_ens99_int_specific_retained2 = ips_domains_ipr_ens99_int_specific_retained2 %>%
+  mutate(ipr_status = if_else((ensembl_transcript_id %in% overlapping.sf.transcripts) & (ipr_accession %in% overlapping.sf.iprs.to.general), "general", ipr_status))
+```
+
+After this step, the number of specific Homologous Superfamily entries went down from `r specific.hs.number` (all Homologous Superfamily entries are specific, because they do not form a hierarchy) to `r ips_domains_ipr_ens99_int_specific_retained2 %>% filter(ipr_status == "specific") %>% filter(ENTRY_TYPE == "Homologous_superfamily") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (some of the entries became general).
+
+## Filter all remaining matches against Homologous Superfamily matches
+
+Now, let us filter out InterPro entries of the types Site, Repeat and Family that overlap with specific Homologous Superfamily entries:
+
+```{r, include=T}
+outside_sf = function(int_start, int_stop, ipr_type, i, ipr_status) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_status = ipr_status)
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  sf_matches = all_matches %>%
+    filter(ipr_type == "Homologous_superfamily") %>%
+    filter(ipr_status == "specific")
+
+  for (j in 1:nrow(sf_matches)) {
+    j_start = sf_matches[j, "int_start"]
+
+    j_stop = sf_matches[j, "int_stop"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(F)
+    }
+  }
+
+  return(T)
+}
+
+calc_retained_iprs = function(int_start, int_stop, ipr_type, ipr_status) {
+  if (!"Homologous_superfamily" %in% ipr_type) {
+    return(rep(T, length(int_start)))
+  }
+
+  retain_ipr = c()
+
+  for (i in 1:length(int_start)) {
+    if ((ipr_type[i] != "Domain") &
+        (ipr_type[i] != "Domain_Family") &
+        (ipr_type[i] != "Homologous_superfamily")) {
+      retain_ipr = c(retain_ipr, outside_sf(int_start, int_stop, ipr_type, i, ipr_status))
+    } else {
+      retain_ipr = c(retain_ipr, T)
+    }
+  }
+
+  return(retain_ipr)
+}
+
+ips_domains_ipr_ens99_int_specific_retained3 = ips_domains_ipr_ens99_int_specific_retained2 %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., retain_ipr = calc_retained_iprs(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_status))) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained3 = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  filter(retain_ipr == T)
+
+ips_domains_ipr_ens99_int_specific_retained3_iprs = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>%
+  unique()
+```
+
+Now we have `r ips_domains_ipr_ens99_int_specific_retained3_iprs %>% length()` unique specific InterPro entries out of `r ips_domains_ipr_ens99_int_specific_retained2_iprs %>% length()` we had on the previous step. `r length(ips_domains_ipr_ens99_int_specific_retained3_iprs[ips_domains_ipr_ens99_int_specific_retained3_iprs %in% humantfs_dbd_ids])` of the retained specific entries are from HumanTFs. Hence, we lost the following `r length(ips_domains_ipr_ens99_int_specific_retained2_iprs[ips_domains_ipr_ens99_int_specific_retained2_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained3_iprs[ips_domains_ipr_ens99_int_specific_retained3_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs:
+
+```{r, include=T}
+kable(dbd_ipr_humantfs[(dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained2_iprs) & (!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained3_iprs),]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are now `r nrow(ips_domains_ipr_ens99_int_specific_retained3)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained3 %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained3 %>% filter(ipr_status == "general"))` are under general matches (this is more than we had on the previous step, because some Homologous Superfamily matches were marked "general" before this filtering step).
+
+Check how many unique InterPro entries of different types we have now:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained3 %>%
+  filter(ipr_status == "specific") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+The number of Domain and Domain-Family did not change, which is correct. The number of specific Homologous Superfamily entries also did not change since we made some of them general, and this is correct. Binding and conserved sites were almost all outside specific Homologous Superfamily entries, while the number of Family and Repeat entries decreased considerably.
+
+Overall, there are `r ips_domains_ipr_ens99_int_specific_retained3 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches, of which `r ips_domains_ipr_ens99_int_specific_retained3 %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are specific and `r ips_domains_ipr_ens99_int_specific_retained3 %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are general (again, this more than we had on the previous step, because some Homologous Superfamily matches became general). The number of matched transcripts is `r ips_domains_ipr_ens99_int_specific_retained3 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`. It did not change from the previous step, which is correct.
+
+## Check overlaps between matches of the Site types
+
+Next, let us prioritize the remaining binding and conserved sites, as they may be parts of domains that were not accounted for by InterPro entries considered so far.
+
+First, check if site entries overlap with each other:
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        overlaps = c(overlaps, T)
+
+        overlap_detected = T
+
+        break
+      }
+    }
+
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(str_detect(ENTRY_TYPE, "site")) %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id, ipr_accession, int_start, int_stop, ENTRY_TYPE) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop))) %>%
+  arrange(ensembl_gene_id, ensembl_transcript_id, int_start, int_stop, ENTRY_TYPE) %>%
+  filter(overlaps == T)
+
+kable(ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, we have `r nrow(ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites)` overlapping sites, and among them there are only `r ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites %>% pull(ipr_accession) %>% unique() %>% length()` unique entries of the type Conserved Site:
+
+```{r, include=T}
+overlapping.site.iprs = ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites %>%
+  pull(ipr_accession) %>%
+  unique()
+
+kable(interpro_entries %>%
+  filter(ENTRY_AC %in% overlapping.site.iprs)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+According to InterPro (see [IPR000637](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR000637/) and [IPR017956](https://www.ebi.ac.uk/interpro/entry/InterPro/IPR017956/)), IPR017956 (AT-hook) is the actual DBD of HMG proteins, so let us retain it and remove IPR000637:
+
+```{r, include=T}
+prev_conserved_sites_number = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  filter(ipr_status == "specific") %>%
+  filter(ENTRY_TYPE == "Conserved_site") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession) %>%
+  distinct() %>%
+  ungroup() %>%
+  pull(ipr_accession) %>%
+  length()
+
+transcripts.with.overlapping.sites = ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites %>%
+  filter(ipr_accession == "IPR000637") %>%
+  pull(ensembl_transcript_id) %>%
+  unique()
+
+ips_domains_ipr_ens99_int_specific_retained3 = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  filter((ipr_accession != "IPR000637") |
+         (!ensembl_transcript_id %in% transcripts.with.overlapping.sites))
+```
+
+After this step, the number of specific Conserved Site entries went down from `r prev_conserved_sites_number` to `r ips_domains_ipr_ens99_int_specific_retained3 %>% filter(ipr_status == "specific") %>% filter(ENTRY_TYPE == "Conserved_site") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`, which is correct (one entry went away in each pair of overlapping entries, and there were `r nrow(ips_domains_ipr_ens99_int_specific_retained3_overlapping.sites)` entries in total).
+
+## Filter all remaining matches against Site matches
+
+Next, let us filter out repeats and families overlapping with the retained sites:
+
+```{r, include=T}
+outside_sites = function(int_start, int_stop, ipr_type, i, ipr_status) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_status = ipr_status)
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  site_matches = all_matches %>%
+    filter((ipr_type == "Binding_site") |
+           (ipr_type == "Conserved_site")) %>%
+    filter(ipr_status == "specific")
+
+  for (j in 1:nrow(site_matches)) {
+    j_start = site_matches[j, "int_start"]
+
+    j_stop = site_matches[j, "int_stop"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(F)
+    }
+  }
+  return(T)
+}
+
+calc_retained_iprs = function(int_start, int_stop, ipr_type, ipr_status) {
+  if ((!"Binding_site" %in% ipr_type) &
+      (!"Conserved_site" %in% ipr_type)) {
+    return(rep(T, length(int_start)))
+  }
+
+  retain_ipr = c()
+
+  for (i in 1:length(int_start)) {
+    if ((ipr_type[i] != "Domain") &
+        (ipr_type[i] != "Homologous_superfamily") &
+        (ipr_type[i] != "Binding_site") &
+        (ipr_type[i] != "Conserved_site")) {
+      retain_ipr = c(retain_ipr, outside_sites(int_start, int_stop, ipr_type, i, ipr_status))
+    } else {
+      retain_ipr = c(retain_ipr, T)
+    }
+  }
+
+  return(retain_ipr)
+}
+
+ips_domains_ipr_ens99_int_specific_retained4 = ips_domains_ipr_ens99_int_specific_retained3 %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., retain_ipr = calc_retained_iprs(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_status))) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained4 = ips_domains_ipr_ens99_int_specific_retained4 %>%
+  filter(retain_ipr == T)
+
+ips_domains_ipr_ens99_int_specific_retained4_iprs = ips_domains_ipr_ens99_int_specific_retained4 %>%
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>%
+  unique()
+```
+
+Now we have `r ips_domains_ipr_ens99_int_specific_retained4_iprs %>% length()` specific InterPro entries out of `r ips_domains_ipr_ens99_int_specific_retained3_iprs %>% length()` we had on the previous step. `r length(ips_domains_ipr_ens99_int_specific_retained4_iprs[ips_domains_ipr_ens99_int_specific_retained4_iprs %in% humantfs_dbd_ids])` of the retained entries are from HumanTFs. Hence, we lost the following `r length(ips_domains_ipr_ens99_int_specific_retained3_iprs[ips_domains_ipr_ens99_int_specific_retained3_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained4_iprs[ips_domains_ipr_ens99_int_specific_retained4_iprs %in% humantfs_dbd_ids])` specific InterPro entry from HumanTFs:
+
+```{r, include=T}
+kable(dbd_ipr_humantfs[(dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained3_iprs) & (!dbd_ipr_humantfs$ENTRY_AC %in% ips_domains_ipr_ens99_int_specific_retained4_iprs),]) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are now `r nrow(ips_domains_ipr_ens99_int_specific_retained4)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained4 %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained4 %>% filter(ipr_status == "general"))` are under general matches.
+
+Check how many unique InterPro entries of different types we have now:
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained4 %>%
+  filter(ipr_status == "specific") %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  ggplot(aes(x = ENTRY_TYPE)) +
+    geom_bar(aes(fill = ENTRY_TYPE)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 11000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+Hence, no repeats overlapped with sites, but some of the family entries did. The number of conserved sites did not change since we filtered out a particular type, which is correct.
+
+Overall, there are `r ips_domains_ipr_ens99_int_specific_retained4 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` matches, of which `r ips_domains_ipr_ens99_int_specific_retained4 %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are specific and `r ips_domains_ipr_ens99_int_specific_retained4 %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` are general. The number of matched transcripts is `r ips_domains_ipr_ens99_int_specific_retained4 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`. It did not change from the previous step, which is correct.
+
+## Check overlaps between matches of Repeats
+
+Finally, let us prioritize repeats over families.
+
+First of all, check if repeats overlap with each other:
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        overlaps = c(overlaps, T)
+
+        overlap_detected = T
+
+        break
+      }
+    }
+
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained4_overlapping.rep = ips_domains_ipr_ens99_int_specific_retained4 %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ENTRY_TYPE == "Repeat") %>%
+  dplyr::select(ensembl_transcript_id, ipr_accession, int_start, int_stop, ENTRY_TYPE) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop))) %>%
+  filter(overlaps == T)
+
+kable(ips_domains_ipr_ens99_int_specific_retained4_overlapping.rep) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, we have no overlapping repeats.
+
+## Filter all remaining matches against Repeat matches
+
+Then, filter out families that overlap with repeats:
+
+```{r, include=T}
+outside_repeats = function(int_start, int_stop, ipr_type, i, ipr_status) {
+  all_matches = data.frame(int_start = int_start,
+                           int_stop = int_stop,
+                           ipr_type = ipr_type,
+                           ipr_status = ipr_status)
+
+  i_start = all_matches[i, "int_start"]
+
+  i_stop = all_matches[i, "int_stop"]
+
+  repeat_matches = all_matches %>%
+    filter(ipr_type == "Repeat") %>%
+    filter(ipr_status == "specific")
+
+  for (j in 1:nrow(repeat_matches)) {
+    j_start = repeat_matches[j, "int_start"]
+
+    j_stop = repeat_matches[j, "int_stop"]
+
+    if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+      return(F)
+    }
+  }
+
+  return(T)
+}
+
+calc_retained_iprs = function(int_start, int_stop, ipr_type, ipr_status) {
+  if (!"Repeat" %in% ipr_type) {
+    return(rep(T, length(int_start)))
+  }
+
+  retain_ipr = c()
+
+  for (i in 1:length(int_start)) {
+    if (ipr_type[i] == "Family") {
+      retain_ipr = c(retain_ipr, outside_repeats(int_start, int_stop, ipr_type, i, ipr_status))
+    } else {
+      retain_ipr = c(retain_ipr, T)
+    }
+  }
+
+  return(retain_ipr)
+}
+
+ips_domains_ipr_ens99_int_specific_retained5 = ips_domains_ipr_ens99_int_specific_retained4 %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., retain_ipr = calc_retained_iprs(.$int_start, .$int_stop, .$ENTRY_TYPE, .$ipr_status))) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained5 = ips_domains_ipr_ens99_int_specific_retained5 %>%
+   filter(retain_ipr == T)
+
+ips_domains_ipr_ens99_int_specific_retained5_iprs = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  filter(ipr_status == "specific") %>%
+  pull(ipr_accession) %>%
+  unique()
+```
+
+Nothing filtered out on this step: there are still `r nrow(ips_domains_ipr_ens99_int_specific_retained5)` signatures in the table overall, of which `r nrow(ips_domains_ipr_ens99_int_specific_retained5 %>% filter(ipr_status == "specific"))` are under specific matches, and `r nrow(ips_domains_ipr_ens99_int_specific_retained5 %>% filter(ipr_status == "general"))` are under general matches. The number of matched transcripts also remains the same (`r ips_domains_ipr_ens99_int_specific_retained5 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`), which is correct.
+
+## Check overlaps between matches of the type Family
+
+Check if we have overlapping InterPro entries among Families:
+
+```{r, include=T}
+check_overlaps = function(int_start, int_stop, ipr_status) {
+  overlaps = c()
+
+  all_coords = data.frame(int_start = int_start,
+                          int_stop = int_stop,
+                          ipr_status = ipr_status)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "int_start"]
+
+    i_stop = all_coords[i, "int_stop"]
+
+    i_ipr_status = all_coords[i, "ipr_status"]
+
+    overlap_detected = F
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "int_start"]
+
+      j_stop = all_coords[j, "int_stop"]
+
+      j_ipr_status = all_coords[j, "ipr_status"]
+
+      if ((min(i_stop, j_stop) - max(i_start, j_start) > 0) &
+          (i_ipr_status == j_ipr_status)) {
+        overlaps = c(overlaps, T)
+
+        overlap_detected = T
+
+        break
+      }
+    }
+
+    if (!overlap_detected) {
+      overlaps = c(overlaps, F)
+    }
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained5_overlapping.fam = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ENTRY_TYPE == "Family") %>%
+  dplyr::select(ensembl_transcript_id, ipr_accession, int_start, int_stop, ENTRY_TYPE, ipr_status) %>%
+  distinct() %>%
+  do(mutate(., overlaps = check_overlaps(.$int_start, .$int_stop, .$ipr_status))) %>%
+  filter(overlaps == T)
+
+kable(ips_domains_ipr_ens99_int_specific_retained5_overlapping.fam) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+No overlaps of specific with specific or general with general Family matches.
+
+Overall, with this filtering stage we went down from  `r ips_domains_ipr_ens99_int_specific_retained %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` to `r ips_domains_ipr_ens99_int_specific_retained5 %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` specific InterPro entry matches, from `r nrow(ips_domains_ipr_ens99_int)` signatures to `r nrow(ips_domains_ipr_ens99_int_specific_retained5 %>% filter(ipr_status == "specific"))` signatures under specific matches, from `r ips_domains_ipr_ens99_iprs %>% length()` unique InterPro entries to `r ips_domains_ipr_ens99_int_specific_retained5_iprs %>% length()` unique specific entries, and from `r length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids])` entries from HumanTFs to `r length(ips_domains_ipr_ens99_int_specific_retained5_iprs[ips_domains_ipr_ens99_int_specific_retained5_iprs %in% humantfs_dbd_ids])` specific ones. Hence, `r length(ips_domains_ipr_ens99_iprs[ips_domains_ipr_ens99_iprs %in% humantfs_dbd_ids]) - length(ips_domains_ipr_ens99_int_specific_retained5_iprs[ips_domains_ipr_ens99_int_specific_retained5_iprs %in% humantfs_dbd_ids])` InterPro entries from HumanTFs were removed or became general after the filtering procedure above. The vast majority of the retained specific InterPro entries are of the Domain type, which is good.
+
+## Compare numbers of all InterPro entry matches before and after filtering
+
+```{r, include=T}
+ipr.matches.before.filtering = ips_domains_ipr_ens99_int_specific_retained %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  count(ENTRY_TYPE) %>%
+  mutate(df_state = "before")
+
+ipr.matches.after.filtering = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  group_by(ensembl_transcript_id) %>%
+  dplyr::select(ipr_accession, ENTRY_TYPE) %>%
+  distinct() %>%
+  ungroup() %>%
+  count(ENTRY_TYPE) %>%
+  mutate(df_state = "after")
+
+ipr.matches.filtering.comparison = ipr.matches.before.filtering %>%
+  bind_rows(ipr.matches.after.filtering) %>%
+  bind_rows(data.frame(ENTRY_TYPE = c("Active_site", "Domain_Family"),
+                       n = c(1, 1),
+                       df_state = c("after", "before"))) %>%
+  mutate(df_state = factor(df_state, levels = c("before", "after")))
+
+p = ipr.matches.filtering.comparison %>%
+  ggplot(aes(x = ENTRY_TYPE,
+             y = log10(n),
+             fill = df_state)) +
+    geom_col(width = .5, 
+             position = "dodge") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(filename = "ipr_matches_filtering_comparison_barplot.pdf",
+       plot = p,
+       width = 5,
+       height = 3)
+
+p
+```
+
+# Select one signature per match
+
+## Initial selection
+
+Now, let us implement the next stage, which is the selection of a representative signature within each InterPro entry in each transcript.
+
+So, after the first stage of filtering we have the following signatures left (in specific InterPro matches):
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99_int_specific_retained5 %>%
+  filter(ipr_status == "specific") %>%
+  dplyr::select(db) %>%
+  ggplot(aes(x = db)) +
+    geom_bar(aes(fill = db)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 30000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+
+ips_domains_ipr_ens99_iprs = ips_domains_ipr_ens99 %>% 
+  pull(ipr_accession) %>% 
+  unique()
+```
+
+Originally, we had (with no specific-general divison yet):
+
+```{r, include=T, fig.width=10}
+ips_domains_ipr_ens99 %>%
+  dplyr::select(db) %>%
+  ggplot(aes(x = db)) +
+    geom_bar(aes(fill = db)) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1) +
+    ylim(c(0, 30000)) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+So, signatures from Hamap and TIGRFAM disappeared. The numbers of signatures from Gene3D, PANTHER, RIRSF, PRINTS, and SUPERFAMILY decreased dramatically. The numbers of signatures from the other databases (CDD, Pfam, ProSitePatterns, ProSiteProfiles, and SMART) also lowered but not as much.
+
+Define the hierarchy of preference of signatures from different databases. Let us prioritize domain databases and put Pfam first as probably the most standard annotation. The order of the other domain databases is determined by the decreasing number of their signatures in our filtered results: Pfam, SMART, ProSiteProfiles, CDD, SUPERFAMILY, Gene3D.
+
+Next, let us put PRINTS and ProSitePatterns. These signatures are sets of small fragments (conserved motifs) that are used to characterize protein families. They often mark a domain or a conserved site. See, for example, IPR001523 in PAX6-201; IPR020479 in DLX6-202; IPR013087 in ZNF195-201 where the ProSitePatterns signature annotated a zinc-finger array; or IPR018362 in NFYA-202.
+
+Finally, place signatures from PIRSF and PANTHER to the end of the list. These are databases of genes, not individual domains ([Mi et al., 2017](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5210595/)), and PANTHER signatures in proteins cover the whole sequence or are much longer than actual domains. See, for example, IPR008122 in TFAP2B-201, IPR001289 in NFYA-202, or IPR028128 in GPBP1-203. Same applies for PIRSF (see IPR001292 in ESR1-202 or ESR1-208). Nevertheless, the presence of a PANTHER or a PIRSF signature helps to recognize a protein as a member of a certain family.
+
+Overall, we got the following signature preference hierarchy:
+
+* Pfam;
+
+* SMART;
+
+* ProSiteProfiles;
+
+* CDD;
+
+* SUPERFAMILY;
+
+* Gene3D;
+
+* PRINTS;
+
+* ProSitePatterns;
+
+* PIRSF;
+
+* PANTHER.
+
+Now let us implement the selection for both general and specific matches.
+
+First, choose a representative signature within each InterPro entry according to the preference hierarchy above:
+
+```{r, include=T}
+# For all domains
+ips_domains_ipr_ens99_int_specific_retained5_raw = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  mutate(source_db = case_when(
+    "Pfam" %in% db ~ "Pfam",
+    "SMART" %in% db ~ "SMART",
+    "ProSiteProfiles" %in% db ~ "ProSiteProfiles",
+    "CDD" %in% db ~ "CDD",
+    "SUPERFAMILY" %in% db ~ "SUPERFAMILY",
+    "Gene3D" %in% db ~ "Gene3D",
+    "PRINTS" %in% db ~ "PRINTS",
+    "ProSitePatterns" %in% db ~ "ProSitePatterns",
+    "PIRSF" %in% db ~ "PIRSF",
+    "PANTHER" %in% db ~ "PANTHER",
+    TRUE ~ "Other"
+  )) %>%
+  filter(db == source_db) %>%
+  ungroup()
+```
+
+Signatures from different databases are now represented as follows:
+
+```{r, include=T, fig.width=10}
+data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"),
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+                                   filter(source_db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  ggplot(aes(x = Database, y = Number_of_domains)) +
+    geom_col(aes(fill = Database)) +
+    geom_text(aes(x = Database, label = Number_of_domains),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    ylim(c(0, 25000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+Now the most part of signatures come from Pfam. The total number of signatures is `r nrow(ips_domains_ipr_ens99_int_specific_retained5_raw)`. PIRSF matches were filtered out.
+
+<!-- # Check that we don't have two or more overlapping matches from a database in the same IRP. -->
+
+## Re-select coordinates for C2H2 ZF and CCCH ZF domains
+
+Secondly, re-select coordinates for C2H2 zinc finger domains and CCCH zinc finger domains (IPR) as SMART seem to represent them better than Pfam (see, for example, IPR013087 in ZNF195-201, ZNF143-202 or ZNF257-203 and IPR000571 in ZC3H8-201, ZGPAT-201, or MBNL2-201): 
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained5_c2h2 = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  filter(str_detect(ipr_description, "C2H2") | # C2H2 ZFs
+         ipr_accession == "IPR000571") %>%     # CCCH ZF
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  mutate(source_db = case_when(
+    "SMART" %in% db ~ "SMART",
+    "Pfam" %in% db ~ "Pfam",
+    "ProSiteProfiles" %in% db ~ "ProSiteProfiles",
+    "CDD" %in% db ~ "CDD",
+    "SUPERFAMILY" %in% db ~ "SUPERFAMILY",
+    "Gene3D" %in% db ~ "Gene3D",
+    "PRINTS" %in% db ~ "PRINTS",
+    "ProSitePatterns" %in% db ~ "ProSitePatterns",
+    "PANTHER" %in% db ~ "PANTHER",
+    TRUE ~ "Other"
+  )) %>%
+  filter(db == source_db) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok = ips_domains_ipr_ens99_int_specific_retained5_raw %>%
+  filter(!str_detect(ipr_description, "C2H2") &
+         ipr_accession != "IPR000571") %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained5_c2h2)
+```
+
+The following domains are now preferrably annotated from SMART:
+
+```{r, include=T}
+kable(interpro_entries %>%
+  filter(ENTRY_AC %in% (ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                          filter(str_detect(ipr_description, "C2H2") |
+                                 ipr_accession == "IPR000571") %>%
+                          pull(ipr_accession) %>%
+                          unique()))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Signatures from different databases are now represented as follows:
+
+```{r, include=T, fig.width=10}
+data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"),
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+                                   filter(source_db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  ggplot(aes(x = Database, y = Number_of_domains)) +
+    geom_col(aes(fill = Database)) +
+    geom_text(aes(x = Database, label = Number_of_domains),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    ylim(c(0, 25000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+The total number of signatures is `r nrow(ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok)`. Hence, prioritizing SMART over Pfam for C2H2-related signatures enabled us to catch `r nrow(ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok) - nrow(ips_domains_ipr_ens99_int_specific_retained5_raw)` more occurences of these domains. And now the majority of signatures come from SMART, as all C2H2 zinc finger domains, as well as CCCH ZF domains, are annotated from this database.
+
+## Re-select coordinates for IPR003656 (BED ZF)
+
+Thirdly, re-select coordinates for IPR003656 ("Zinc finger, BED-type"), as a signature SM00614 from SMART integrated into this entry is not relevant (according to InterPro support, this signature overhits many proteins, in comparison to other signatures integrated into the entry):
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained5_IPR003656 = ips_domains_ipr_ens99_int_specific_retained5 %>%
+  filter(ipr_accession == "IPR003656") %>% # "Zinc finger, BED-type"
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  mutate(source_db = case_when(
+    "Pfam" %in% db ~ "Pfam",
+    "ProSiteProfiles" %in% db ~ "ProSiteProfiles",
+    "CDD" %in% db ~ "CDD",
+    "SUPERFAMILY" %in% db ~ "SUPERFAMILY",
+    "Gene3D" %in% db ~ "Gene3D",
+    "PRINTS" %in% db ~ "PRINTS",
+    "ProSitePatterns" %in% db ~ "ProSitePatterns",
+    "PANTHER" %in% db ~ "PANTHER",
+    "SMART" %in% db ~ "SMART",
+    TRUE ~ "Other"
+  )) %>%
+  filter(db == source_db) %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok = ips_domains_ipr_ens99_int_specific_retained5_c2h2.ok %>%
+  filter(ipr_accession != "IPR003656") %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained5_IPR003656)
+```
+
+Signatures from different databases are now represented as follows:
+
+```{r, include=T, fig.width=10}
+data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"),
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+                                   filter(source_db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  ggplot(aes(x = Database, y = Number_of_domains)) +
+    geom_col(aes(fill = Database)) +
+    geom_text(aes(x = Database, label = Number_of_domains),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    ylim(c(0, 25000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+The total number of signatures is `r nrow(ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok)`. The number of SMART signatures did not change, which means that either SM00614 or other signatures are present in IPR003656. Consequently, we will need to remove signature SM00614 from IPR003656 later.
+
+## Re-select coordinates for signatures from Gene3D, PRINTS and ProSitePatterns
+
+Next, for domains represented by coordinates from Gene3D, PRINTS or ProSitePatterns and that are not C2H2 zinc finger arrays, take the most upstream and the most downstream coordinates for further analysis (these signatures can be sets of small fragments under one InterPro entry; see, for example, IPR008121 in TFAP2A-201, IPR020479 in HOXA11-201, IPR032675 in FBXL19-201, IPR012295 in TBP-206, or IPR000637 and IPR000116 in HMGA2-201):
+
+```{r, include=T}
+get_final_coordinates = function(start, stop, source_db, ipr_description) {
+  if (((unique(source_db) != "PRINTS") &
+       (unique(source_db) != "ProSitePatterns") &
+       (unique(source_db) != "Gene3D")) |
+      (str_detect(unique(ipr_description), "C2H2"))) {
+    return(str_c(as.character(start), "_", as.character(stop)))
+  } else {
+    return(str_c(as.character(min(start)), "_", as.character(max(stop))))
+  }
+}
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok = ips_domains_ipr_ens99_int_specific_retained5_IPR003656.ok %>%
+  group_by(ensembl_transcript_id, ipr_accession) %>%
+  do(mutate(., final_coordinates = get_final_coordinates(.$start, .$stop, .$source_db, .$ipr_description))) %>%
+  mutate(start = unlist(purrr::map(str_split(final_coordinates, "_"), 1))) %>%
+  mutate(stop = unlist(purrr::map(str_split(final_coordinates, "_"), 2))) %>%
+  dplyr::select(-final_coordinates) %>%
+  mutate(evalue = ifelse(((source_db == "PRINTS") |
+                          (source_db == "ProSitePatterns") |
+                          (source_db == "Gene3D")) &
+                         (!str_detect(ipr_description, "C2H2")), NA, as.character(evalue))) %>%
+  mutate(go_terms = ifelse(((source_db == "PRINTS") |
+                            (source_db == "ProSitePatterns") |
+                            (source_db == "Gene3D")) &
+                           (!str_detect(ipr_description, "C2H2")), NA, go_terms)) %>%
+  mutate(pathways = ifelse(((source_db == "PRINTS") |
+                            (source_db == "ProSitePatterns") |
+                            (source_db == "Gene3D")) &
+                           (!str_detect(ipr_description, "C2H2")), NA, pathways)) %>%
+  ungroup() %>%
+  distinct()
+```
+
+The numbers of retained signatures are as follows:
+
+```{r, include=T, fig.width=10}
+data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"),
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  ggplot(aes(x = Database, y = Number_of_domains)) +
+    geom_col(aes(fill = Database)) +
+    geom_text(aes(x = Database, label = Number_of_domains),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    ylim(c(0, 25000)) +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+So the numbers of signatures from PRINTS and Gene3D decreased, which is expected. The number of signatures from PRINTS lowered most dramatically. The total number of signatures is `r nrow(ips_domains_ipr_ens99_int_specific_retained5_prints.ok)`.
+
+## Compare the number of signature matches before and after filtering
+
+```{r, include}
+signature.matches.before.df = data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"), 
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5 %>%
+                                   filter(db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  mutate(df_state = "before")
+
+signature.matches.after.df = data.frame(Database = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"),
+           Number_of_domains = c(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "Pfam") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "SMART") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "ProSiteProfiles") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "CDD") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "SUPERFAMILY") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "Gene3D") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PRINTS") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "ProSitePatterns") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PIRSF") %>%
+                                   nrow(),
+                                 ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+                                   filter(source_db == "PANTHER") %>%
+                                   nrow())) %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PIRSF", "PANTHER"))) %>%
+  mutate(df_state = "after") %>%
+  mutate(Number_of_domains = ifelse(Number_of_domains == 0, 1, Number_of_domains))
+
+p = signature.matches.before.df %>%
+  bind_rows(signature.matches.after.df) %>%
+  mutate(df_state = factor(df_state, levels = c("before", "after"))) %>%
+  ggplot(aes(x = Database, 
+             y = log10(Number_of_domains),
+             fill = df_state)) +
+    geom_col(position = "dodge") +
+    geom_text(aes(x = Database, label = Number_of_domains),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    theme_classic() +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 0.5))
+
+ggsave(filename = "signature_matches_filtering_comparison_barplot.pdf",
+       plot = p,
+       width = 6,
+       height = 3)
+
+p
+```
+
+## Check general matches not overlapping with related specific ones
+
+Check which domain matches do general domain matches intersect:
+  
+```{r, include=T}
+is_i_ancestor_for_j = function(ipr_hierarchy, i_accession, j_accession) {
+  i_node = FindNode(ipr_hierarchy, i_accession)
+
+  if (!is.null(i_node)) {
+    i_node_t = Traverse(i_node)
+
+    i_node_succ = unlist(lapply(seq_along(i_node_t), function(i) {i_node_t[[i]]$name}))
+
+    return(j_accession %in% i_node_succ)
+  } else {
+    return(F)
+  }
+}
+
+detect_overlaps = function(ipr_hierarchy, ipr_accession, start, stop) {
+  overlaps = c()
+
+  match_df = data.frame(ipr_accession = as.character(ipr_accession),
+                        start = as.numeric(start),
+                        stop = as.numeric(stop),
+                        stringsAsFactors = FALSE)
+
+  for (i in 1:nrow(match_df)) {
+    i_ipr_accession = match_df[i, "ipr_accession"]
+
+    i_start = match_df[i, "start"]
+
+    i_stop = match_df[i, "stop"]
+
+    i_overlaps = F
+
+    for (j in 1:nrow(match_df)) {
+      if (j == i) {
+        next
+      }
+
+      j_ipr_accession = match_df[j, "ipr_accession"]
+
+      j_start = match_df[j, "start"]
+
+      j_stop = match_df[j, "stop"]
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        if (is_i_ancestor_for_j(ipr_hierarchy, i_ipr_accession, j_ipr_accession)) {
+          i_overlaps = T
+          break
+        }
+      }
+    }
+
+    overlaps = c(overlaps, i_overlaps)
+  }
+
+  return(overlaps)
+}
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  group_by(ensembl_transcript_id) %>%
+  filter(ENTRY_TYPE == "Domain") %>%
+  do(mutate(., overlaps = detect_overlaps(ipr_hierarchy, 
+                                          .$ipr_accession,
+                                          .$start, 
+                                          .$stop))) %>%
+  filter(ipr_status == "general") %>%
+  ungroup()
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general2specific = ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general %>%
+  filter(!overlaps) %>%
+  mutate(ipr_status = "specific") %>%
+  dplyr::select(-overlaps)
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general.ok = ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general %>%
+  filter(overlaps) %>%
+  dplyr::select(-overlaps)
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.specific = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  filter(ENTRY_TYPE == "Domain") %>%
+  filter(ipr_status == "specific")
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_nondom = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  filter(ENTRY_TYPE != "Domain")
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general.corrected = ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general2specific %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general.ok) %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.specific) %>%
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained5_prints.ok_nondom)
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok = ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general.corrected
+```
+
+So `r nrow(ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general2specific)` general domain matches do not intersect their child (more specific) matches. Hence, we qualified these general matches as specific. Here is the list of the InterPro accessions of these matches:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok_dom.general2specific %>%
+        dplyr::select(ipr_accession, ipr_description) %>%
+        distinct() %>%
+        arrange(ipr_accession)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+# Examples of domain architectures in TFs
+
+Some examples of domain architectures in TF isoforms are shown below:
+
+1) __ZNF248:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000395867") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+2) __POU2F2:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000342301") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+A POU domain contains a POU-specific domain and a Homeodomain, which is how it should be. But later, to avoid redundancy, we will need to remove the POU domain and retain only the POU-specific domain and the Homeodomain that the POU domain overlaps.
+
+3) __HMGA2:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000403681") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+4) __TBX19:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000431969") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+5) __SMYD3:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000490107") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+A MYND domain is incorporated into a SET domain here.
+
+6) __ZNF415:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000421033") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Here we have two BED zinc finger matches overlapping C2H2 ZF matches. This is caused by the problematic signature SM00614 from IPR003656. We will exclude this signature later on.
+
+7) __FBXL19:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000338343") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+8) __KMT2A:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000389506") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+9) __YBX2:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000007699") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ENTRY_TYPE, ipr_ancestor, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+10) __MGA:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000219905") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+11) __TP63:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000434928") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+12) __TRPS1:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000220888") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+13) __MYF6:__
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+        mutate(start = as.numeric(start)) %>%
+        mutate(stop = as.numeric(stop)) %>%
+        filter(ensembl_transcript_id == "ENST00000228641") %>%
+        dplyr::select(ensembl_gene_id, ensembl_transcript_id, source_db, ipr_accession, ipr_status, ipr_description, start, stop) %>%
+        arrange(ensembl_gene_id, ensembl_transcript_id, start, stop)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+The basic domain here is incorrect (it is clearly too long). We will correct this later.
+
+# Classify domains into different types
+
+Let us have a list of InterPro entries of all domains retained for the analysis (both specific and general):
+
+```{r, include=T}
+# Family-type entries that turned into Domain_Family entries may still retain
+# Family type in some transcripts where they are not matched by domain signatures.
+# So the number of rows in this table can be greater than the total number of
+# InterPro entries retained for analysis, because one and the same entry can have
+# Domain_Family type in one transcript but Family type in another transcript.
+
+domain_table = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  dplyr::select(ipr_accession, ipr_description, ENTRY_TYPE) %>%
+  arrange(ipr_accession) %>%
+  distinct()
+
+saveRDS(domain_table,
+        file = "domain_table.rds")
+
+write.table(domain_table,
+            file = "domain_table.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+At this point, I ran a custom script that classified all domains into "Non-DBD" (those who do not have any mention of "DNA" in their InterPro description) and others (empty category: "") who have at least one mention of "DNA" in their InterPro descriptions. It produced the file "interpro_domain_binary_classification.tsv" which is used below.
+
+Form a preliminary domain classification (here we remove Family entries as they do not represent domains):
+
+```{r, include=T}
+draft_classification_table = read.delim(draft_classification_table_name)
+
+prelim_classification_table = domain_table %>%
+  left_join(draft_classification_table, by = "ipr_accession") %>%
+  filter(ENTRY_TYPE != "Family")
+
+write.table(prelim_classification_table,
+            file = "prelim_classification_table.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+Also, let us move Family entries from the final set of matches into a separate set:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok.fam = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  filter(ENTRY_TYPE == "Family")
+
+ips_domains_ipr_ens99_int_specific_retained5_prints.ok = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  filter(ENTRY_TYPE != "Family")
+```
+
+Next, I manually curated the preliminary binary classification (Non-DBD vs. everything else) using domain descriptions from InterPro, descriptions of individual signatures and scanning results in TF isoforms. I classified the domains into the following categories:
+
+* __"DBD"__: DNA-binding domain, according to its InterPro description;
+
+* __"Other"__: domain with a function different from DNA-binding, according to the InterPro description of the domain;
+
+* __"Non-DBD"__: category formed automatically in the step above;
+
+* __"Unknown"__: domain with an unknown function, as stated in its InterPro description;
+
+* __"Unclear"__: domain whose function is not mentioned in its InterPro description.
+
+I saved the resulting table into `domain_table_manually_annotated.xlsx` which is used below.
+
+Stratify domains in the InterProScan results into DBDs and others:
+
+```{r, include=T}
+domain_classification_wb = loadWorkbook(domain_classification_wb_name)
+
+domain_classification_table = readWorksheet(domain_classification_wb, sheet = "domain_table_manually_annotated", header = TRUE)
+
+ips_domains_ipr_ens99_final_strat = ips_domains_ipr_ens99_int_specific_retained5_prints.ok %>%
+  left_join(domain_classification_table, by = "ipr_accession") %>%
+  dplyr::select(-c("ipr_description.y", "ENTRY_TYPE.y")) %>%
+  dplyr::rename("ipr_description" = "ipr_description.x",
+                "ENTRY_TYPE" = "ENTRY_TYPE.x",
+                "domain_type" = "category")
+```
+
+# Check domain types and print statistics
+
+Check that no matches lack an associated domain type:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_final_strat %>%
+        filter(!domain_type %in% c("DBD", "Non-DBD", "Other", "Unclear", "Unknown")) %>%
+        dplyr::select(ensembl_transcript_id, ipr_accession, domain_type) %>%
+        nrow()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Check that no matches have empty comments:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_final_strat %>%
+        filter((category_comment == "") | (is.na(category_comment)))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, all matches have proper category values and non-empty comments associated with them.
+
+For each database, the following plot shows the number of domain types annotated using this database (different instances of the same domain type can be annotated using different databases; for example, in one transcript a particular domain was matched by a Pfam profile, while in another transcript a SMART profile gave a better match for the same domain):
+
+```{r, include=T, fig.width=12}
+ips_domains_ipr_ens99_final_strat = ips_domains_ipr_ens99_final_strat %>%
+  mutate(ipr_accession = as.character(ipr_accession))
+
+pfam_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Pfam") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pfam_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Pfam") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pfam_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Pfam") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pfam_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Pfam") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pfam_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Pfam") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+smart_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SMART") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+smart_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SMART") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+smart_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SMART") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+smart_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SMART") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+smart_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SMART") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspr_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSiteProfiles") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspr_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSiteProfiles") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspr_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSiteProfiles") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspr_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSiteProfiles") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspr_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSiteProfiles") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+cdd_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "CDD") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+cdd_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "CDD") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+cdd_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "CDD") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+cdd_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "CDD") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+cdd_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "CDD") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+sf_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SUPERFAMILY") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+sf_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SUPERFAMILY") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+sf_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SUPERFAMILY") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+sf_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SUPERFAMILY") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+sf_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "SUPERFAMILY") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+gene3d_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Gene3D") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+gene3d_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Gene3D") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+gene3d_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Gene3D") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+gene3d_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Gene3D") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+gene3d_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "Gene3D") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+prints_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PRINTS") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+prints_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PRINTS") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+prints_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PRINTS") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+prints_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PRINTS") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+prints_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PRINTS") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspt_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSitePatterns") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspt_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSitePatterns") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspt_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSitePatterns") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspt_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSitePatterns") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+pspt_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "ProSitePatterns") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+panther_domains_dbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PANTHER") & (domain_type == "DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+panther_domains_other = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PANTHER") & (domain_type == "Other")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+panther_domains_nondbd = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PANTHER") & (domain_type == "Non-DBD")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+panther_domains_unknown = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PANTHER") & (domain_type == "Unknown")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+panther_domains_unclear = ips_domains_ipr_ens99_final_strat %>%
+  filter((source_db == "PANTHER") & (domain_type == "Unclear")) %>%
+  pull(ipr_accession) %>%
+  unique()
+
+dbd_other_domain_numbers = data.frame("Database" = c(rep("Pfam", 5),
+                                                     rep("SMART", 5),
+                                                     rep("ProSiteProfiles", 5),
+                                                     rep("CDD", 5),
+                                                     rep("SUPERFAMILY", 5),
+                                                     rep("Gene3D", 5),
+                                                     rep("PRINTS", 5),
+                                                     rep("ProSitePatterns", 5),
+                                                     rep("PANTHER", 5)),
+                                      "Category" = c(rep(c("DBD", "Other", "Unknown", "Unclear", "Non-DBD"), 9)),
+                                      "Number" = c(length(pfam_domains_dbd), length(pfam_domains_other), length(pfam_domains_unknown), length(pfam_domains_unclear), length(pfam_domains_nondbd),
+                                                   length(smart_domains_dbd), length(smart_domains_other), length(smart_domains_unknown), length(smart_domains_unclear), length(smart_domains_nondbd),
+                                                   length(pspr_domains_dbd), length(pspr_domains_other), length(pspr_domains_unknown), length(pspr_domains_unclear), length(pspr_domains_nondbd),
+                                                   length(cdd_domains_dbd), length(cdd_domains_other), length(cdd_domains_unknown), length(cdd_domains_unclear), length(cdd_domains_nondbd),
+                                                   length(sf_domains_dbd), length(sf_domains_other), length(sf_domains_unknown), length(sf_domains_unclear), length(sf_domains_nondbd),
+                                                   length(gene3d_domains_dbd), length(gene3d_domains_other), length(gene3d_domains_unknown), length(gene3d_domains_unclear), length(gene3d_domains_nondbd),
+                                                   length(prints_domains_dbd), length(prints_domains_other), length(prints_domains_unknown), length(prints_domains_unclear), length(prints_domains_nondbd),
+                                                   length(pspt_domains_dbd), length(pspt_domains_other), length(pspt_domains_unknown), length(pspt_domains_unclear), length(pspt_domains_nondbd),
+                                                   length(panther_domains_dbd), length(panther_domains_other), length(panther_domains_unknown), length(panther_domains_unclear), length(panther_domains_nondbd)))
+
+dbd_other_domain_numbers %>%
+  mutate(Database = factor(Database, levels = c("Pfam", "SMART", "ProSiteProfiles", "CDD", "SUPERFAMILY", "Gene3D", "PRINTS", "ProSitePatterns", "PANTHER"))) %>%
+    ggplot(aes(x = Database, y = Number, group = Category)) +
+    geom_col(aes(fill = Category), position = "dodge") +
+    geom_text(aes(x = Database, label = Number),
+              position = position_dodge(width = 1),
+              vjust = -1) +
+    ylim(c(0, 150)) +
+    theme_classic()
+```
+
+The total number of DBD types is `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "DBD") %>% pull(ipr_accession) %>% unique() %>% length()` (`r ips_domains_ipr_ens99_final_strat %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% pull(ipr_accession) %>% unique() %>% length()` of them are specific); the total number of other domain types is `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "Other") %>% pull(ipr_accession) %>% unique() %>% length()`. The total number of all domain types is `r ips_domains_ipr_ens99_final_strat %>% pull(ipr_accession) %>% unique() %>% length()`. The total number of "unknown" (uncharacterized) and unclear domain types is relatively small (`r ips_domains_ipr_ens99_final_strat %>% filter((domain_type == "Unknown") | (domain_type == "Unclear")) %>% pull(ipr_accession) %>% unique() %>% length()`), which is good. Finally, the total number of non-DBD domains that should be classified into other, unknown and unclear types is `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "Non-DBD") %>% pull(ipr_accession) %>% unique() %>% length()`, which is still a lot to handle. However, currently, the key point is that they are most probably not DBDs.
+
+The plot shows `r dbd_other_domain_numbers %>% filter(Category == "DBD") %>% pull(Number) %>% sum()` DBD types and `r dbd_other_domain_numbers %>% filter(Category == "Other") %>% pull(Number) %>% sum()` other domain types. The difference with the stats above is caused by the aforementioned fact that different instances of the same domain can be matched by profiles from different databases, and so the same domain can be counted multiple times in the plot above.
+
+Numbers of different types of specific domains:
+
+```{r, include=T, fig.width=4, fig.height=6}
+ggplot(data = data.frame("Category" = c("DBD", "Other", "Unknown", "Unclear", "Non-DBD"),
+                         "Count" = c(ips_domains_ipr_ens99_final_strat %>%
+                                       filter(ipr_status == "specific") %>%
+                                       filter(domain_type == "DBD") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(ipr_status == "specific") %>%
+                                       filter(domain_type == "Other") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(ipr_status == "specific") %>%
+                                       filter(domain_type == "Unknown") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(ipr_status == "specific") %>%
+                                       filter(domain_type == "Unclear") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(ipr_status == "specific") %>%
+                                       filter(domain_type == "Non-DBD") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length())),
+       aes(x = Category, y = Count, group = Category)) +
+  geom_col(aes(fill = Category), position = "dodge") +
+  geom_text(aes(x = Category, label = Count),
+            position = position_dodge(width = 1),
+            vjust = -1) +
+  ylim(c(0, 200)) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+Numbers of different types of all domains:
+
+```{r, include=T, fig.width=4, fig.height=6}
+p = ggplot(data = data.frame("Category" = c("DBD", "Other", "Unknown", "Unclear", "Non-DBD"),
+                         "Count" = c(ips_domains_ipr_ens99_final_strat %>%
+                                       filter(domain_type == "DBD") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(domain_type == "Other") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(domain_type == "Unknown") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(domain_type == "Unclear") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length(),
+                                     ips_domains_ipr_ens99_final_strat %>%
+                                       filter(domain_type == "Non-DBD") %>%
+                                       pull(ipr_accession) %>%
+                                       unique() %>%
+                                       length())),
+       aes(x = Category, y = Count, group = Category)) +
+  geom_col(aes(fill = Category), position = "dodge") +
+  geom_text(aes(x = Category, label = Count),
+            position = position_dodge(width = 1),
+            vjust = -1) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+ggsave(filename = "ipr_prelim_classification_barplot.pdf",
+       plot = p,
+       width = 3,
+       height = 3)
+
+p
+```
+
+Overall, there are `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "DBD") %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` specific DBD-related matches (a match can have multiple domains of the same type in it; for example this is the case with C2H2 zinc fingers) and `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "Other") %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` specific other matches.
+
+The number of all DBD InterPro entry matches is `r ips_domains_ipr_ens99_final_strat %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+The number of specific DBD-related InterPro entries (`r ips_domains_ipr_ens99_final_strat %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% pull(ipr_accession) %>% unique() %>% length()`) is way greater than the number of general TF families from HumanTFs (`r ips_domains_ipr_ens99_final_strat %>% left_join(tfs, by = c("ensembl_gene_id" = "Ensembl.ID")) %>% dplyr::select(-c(names(tfs)[(names(tfs) != "DBD") & (names(tfs) != "Ensembl.ID")])) %>% pull(DBD) %>% unique() %>% length()`). This is explained by the fact that there are some noncanonical DBDs, not used to form families, and also different subtypes of the same DBD.
+
+Indeed, a part of these specific DBD-related entries have ancestor (more general) InterPro entries, but most of them do not: from `r ips_domains_ipr_ens99_final_strat %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% pull(ipr_accession) %>% unique() %>% length()` specific DBD-related entries, `r ips_domains_ipr_ens99_final_strat %>%  filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% filter(is.na(ipr_ancestor)) %>% pull(ipr_accession) %>% unique() %>% length()` do not have any ancestor entries. Consequently, the most part of the DBD types should represent subfamilies of the general TF families or be non-canonical.
+
+Write down tables for downstream modules:
+
+```{r, include=T}
+saveRDS(ips_domains_ipr_ens99_final_strat,
+        file = "ips_domains_ipr_ens99_final_strat.rds")
+
+saveRDS(ips_domains_ipr_ens99_int_specific_retained,
+        file = "ips_domains_ipr_ens99_int_specific_retained.rds")
+
+write.table(ips_domains_ipr_ens99_final_strat,
+            file = "ips_domains_ipr_ens99_final_strat.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+            
+write.table(ips_domains_ipr_ens99_int_specific_retained,
+            file = "ips_domains_ipr_ens99_int_specific_retained.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```

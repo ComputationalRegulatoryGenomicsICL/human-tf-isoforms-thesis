@@ -1,0 +1,1770 @@
+---
+title: "Select domains and TF isoforms for analysis"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    collapsed: no
+    fig_align: center
+    fig_caption: yes
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r, include=T}
+stringsAsFactors = F
+
+library(tidyverse)
+library(seqinr)
+library(kableExtra)
+library(biomaRt)
+library(XLConnect)
+library(R.utils)
+```
+
+# Print package versions
+
+Print versions of the loaded libraries:
+
+```{r, include=T}
+R.version
+packageVersion("base")
+packageVersion("tidyverse")
+packageVersion("seqinr")
+packageVersion("kableExtra")
+packageVersion("biomaRt")
+```
+
+# Read input
+
+Read args:
+
+```{r, include=T}
+args = commandArgs()
+
+ensg_enst_ensp_name = args[9]
+tfs_name = args[10]
+ips_domains_ipr_ens99_final_strat_name = args[11]
+protein_fasta_tfs_99_name = args[12]
+ips_domains_ipr_ens99_int_specific_retained_name = args[13]
+domain_classification_wb_name = args[14]
+ensg_enst_tsl_name = args[15]
+humantfs_name = args[16]
+```
+
+# Make the final table of all human TF isoforms
+
+Load tables for this section:
+
+```{r, include=T}
+ensg_enst_ensp = read.delim(gunzip(ensg_enst_ensp_name))
+
+tfs = readRDS(tfs_name)
+
+ips_domains_ipr_ens99_final_strat = readRDS(ips_domains_ipr_ens99_final_strat_name)
+```
+
+Make a table of isoforms without domains (i. e., without matches to InterPro entries):
+
+```{r, include=T}
+all_tf_proteins = ensg_enst_ensp %>%
+  filter(ensembl_gene_id %in% tfs$Ensembl.ID) %>%
+  pull(ensembl_peptide_id) %>%
+  unique()
+
+matched_tf_proteins = ips_domains_ipr_ens99_final_strat %>%
+  filter(ENTRY_TYPE != "Family") %>%
+  pull(protein_accession) %>%
+  unique()
+
+unmatched_tf_proteins = all_tf_proteins[!all_tf_proteins %in% matched_tf_proteins]
+
+protein_fasta = read.fasta(file = gunzip(protein_fasta_tfs_99_name), seqtype = "AA")
+
+is.unmatched = function(protein_record) {
+  protein_id = as.character(str_match(getAnnot(protein_record), "ENSP[0-9]+"))
+  return(protein_id %in% unmatched_tf_proteins)
+}
+
+unmatched_protein_fasta = protein_fasta[unlist(lapply(protein_fasta, function(p) {is.unmatched(p)}))]
+
+ensp_unmatched_id = as.character(str_match(getAnnot(unmatched_protein_fasta), "ENSP[0-9]+"))
+
+ensp_unmatched_length = as.numeric(purrr::map(seqinr::getSequence(unmatched_protein_fasta, as.string = T), nchar))
+
+no_domain_tf_transcripts = ensg_enst_ensp %>%
+  filter(ensembl_peptide_id %in% ensp_unmatched_id) %>%
+  left_join(data.frame("ensp_unmatched_id" = ensp_unmatched_id,
+                       "ensp_unmatched_length" = ensp_unmatched_length),
+            by = c("ensembl_peptide_id" = "ensp_unmatched_id")) %>%
+  dplyr::rename(seq_len = ensp_unmatched_length) %>%
+  dplyr::rename(protein_accession = ensembl_peptide_id) %>%
+  mutate(seq_md5 = NA) %>%
+  mutate(db = NA) %>%
+  mutate(domain_accession = NA) %>%
+  mutate(domain_description = NA) %>%
+  mutate(start = NA) %>%
+  mutate(stop = NA) %>%
+  mutate(evalue = NA) %>%
+  mutate(status = NA) %>%
+  mutate(run_date = NA) %>%
+  mutate(ipr_accession = NA) %>%
+  mutate(ipr_description = NA) %>%
+  mutate(go_terms = NA) %>%
+  mutate(pathways = NA) %>%
+  mutate(source_db = NA) %>%
+  mutate(domain_type = NA) %>%
+  mutate(int_start = NA) %>%
+  mutate(int_stop = NA) %>%
+  mutate(retain_ipr = NA) %>%
+  mutate(ENTRY_TYPE = NA) %>%
+  mutate(ipr_status = NA) %>%
+  mutate(ipr_ancestor = NA) %>%
+  dplyr::select(protein_accession, seq_md5, seq_len, db, domain_accession, domain_description,
+                start, stop, evalue, status, run_date, ipr_accession, ipr_description,
+                go_terms, pathways, ensembl_gene_id, ensembl_transcript_id, int_start, int_stop, ENTRY_TYPE,
+                ipr_status, ipr_ancestor, retain_ipr, source_db, domain_type)
+```
+
+Here is a snippet of the table:
+
+```{r, include=T}
+kable(head(no_domain_tf_transcripts)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+This table contains `r no_domain_tf_transcripts %>% pull(ensembl_transcript_id) %>% unique() %>% length()` isoforms.
+
+Combine the tables of isoforms with and without domains:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99 = ips_domains_ipr_ens99_final_strat %>%
+  bind_rows(no_domain_tf_transcripts) %>%
+  dplyr::select(-source_db)
+```
+
+Number of genes: `r tf_coding_transcripts_final_ens99 %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99 %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99 %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99 %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99 %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99 %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99 %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99 %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99 %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99 %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99 %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99 %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+The table also contains `r tf_coding_transcripts_final_ens99 %>% filter(domain_type == "Other") %>% filter(ipr_status == "specific") %>% pull(ipr_accession) %>% unique() %>% length()` specific other domain types, which is correct.
+
+A simple bar-chart showing the proportion of matched and unmatched isoforms:
+
+```{r, include=T, fig.width=4, fig.height=6}
+ggplot(data = data.frame("Category" = c("Domains+", "Domains-"),
+                         "Count" = c(tf_coding_transcripts_final_ens99 %>%
+                                       filter(!is.na(ipr_accession)) %>%
+                                       pull(ensembl_transcript_id) %>%
+                                       unique() %>%
+                                       length(),
+                                     tf_coding_transcripts_final_ens99 %>%
+                                       filter(is.na(ipr_accession)) %>%
+                                       pull(ensembl_transcript_id) %>%
+                                       length()),
+                         "x" = rep("Transcripts", 2)),
+       aes(x = x, y = Count, group = x)) +
+  geom_col(aes(fill = Category)) +
+  ylim(c(0, 7500)) +
+  theme_classic()
+```
+
+Assign TF families to all isoforms:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = tf_coding_transcripts_final_ens99 %>%
+  left_join(tfs, by = c("ensembl_gene_id" = "Ensembl.ID")) %>%
+  dplyr::select(-c(names(tfs)[(names(tfs) != "DBD") & (names(tfs) != "Ensembl.ID")]))
+```
+
+Check that there are no isoforms (with or without domain matches) that do not belong to a general TF family:
+
+```{r, include=T}
+kable(tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter(is.na(DBD))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+There are no NAs in TF family names, so every record has an associated family name.
+
+Add gene names from HumanTFs:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names =
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  left_join(tfs %>% dplyr::select(Ensembl.ID, HGNC.symbol), 
+            by = c("ensembl_gene_id" = "Ensembl.ID")) %>%
+  dplyr::rename("humantfs_gene_name" = "HGNC.symbol")
+```
+
+# Correct DBD matches in isoforms
+
+Before beginning the analysis, we need to additionally correct DBD matches.
+
+1. The only PANTHER matches are in IRF, and they do not represent domains (the HMM length of PTHR11949 is 349, so it certainly covers much more than a domain).
+
+So we need to remove these PANTHER matches:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # The only macthes in this transcript are the PANTHER ones, 
+  # so I need to remove them retaining the isoform itself:
+  filter(ensembl_transcript_id == "ENST00000505067") %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(ensembl_transcript_id != "ENST00000505067")) %>%
+  # and then I just remove all other PANTHER matches 
+  # (they are not the only macthes in the corresponding isoforms)
+  filter((db != "PANTHER") | is.na(db))
+```
+
+2. Remove zinc finger ribbons (3 C2H2 ZF motifs as one domain, IPR031799), as they almost always conincide with separate zinc finger motifs (and those few ribbon matches that do not coincide are most probably partial and do not represent whole zinc finger motifs):
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # In isoform ENST00000593661,
+  # a zinc finger ribbon is the only match, so I need to remove it
+  # retaining the isoform itsef:
+  filter(ensembl_transcript_id == "ENST00000593661") %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(ensembl_transcript_id != "ENST00000593661"))
+
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # In isoform ENST00000594748,
+  # a zinc finger ribbon is the only match, so I need to remove it
+  # retaining the isoform itself:
+  filter(ensembl_transcript_id == "ENST00000594748") %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(ensembl_transcript_id != "ENST00000594748"))
+
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # In other isoforms, these ribbons coincide with
+  # separate zinc finger motifs, so I just need to remove 
+  # the ribbon matches
+  filter((ipr_accession != "IPR031799") | is.na(ipr_accession))
+```
+
+3. Remove zinc finger dimers, as they almost always conincide with separate zinc finger motifs (and those few ribbon matches that do not coincide are most probably partial and do not represent whole zinc finger motifs):
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # In isoform ENST00000421864,
+  # a zinc finger dimer is the only match, so I need to remove it
+  # retaining the isoform itself:
+  filter(ensembl_transcript_id == "ENST00000421864") %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(ensembl_transcript_id != "ENST00000421864"))
+
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # In other isoforms, these dimers coincide with
+  # separate zinc finger motifs, so I just need to remove 
+  # the dimer matches
+  filter((ipr_accession != "IPR041661") | is.na(ipr_accession))
+```
+
+4. Remove the triple CCCH ZF-match (IPR041686), as it coincides with separate CCCH ZF matches:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR041686") | is.na(ipr_accession))
+```
+
+5. Remove the VDR DBD matches (IPR042153) as they coincide with the dimeric zinc finger motif matches (IPR001628):
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR042153") | is.na(ipr_accession))
+```
+
+6. Remove the POU domain (IPR013847) as it always overlaps with Homeobox and/or POU-specific domains:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR013847") | is.na(ipr_accession))
+```
+
+7. Remove matches of the C-terminal part of Homeobox engrailed (IPR019549; it always coincides with the homeobox match):
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR019549") | is.na(ipr_accession))
+```
+
+8. Remove CTF transcription factor/nuclear factor 1, DNA-binding domain matches (IPR020604), as they always contain IPR019548 (CTF TF/NF1, N-terminal) and/or IPR003619 (MH1, Dwarfin-type) matches:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR020604") | is.na(ipr_accession))
+```
+
+9. In two very short isoforms of RBPJ gene from the CSL family, ENST00000509158 and ENST00000514807, remove the only two matches: "p53-like transcription factor, DNA-binding" (IPR008967) and "RBP-J/Cbf11/Cbf12, DNA binding domain superfamily" (IPR037095) matches. The problem is that they are very general, and the proper CSL (LAG-1) DBD ("RBP-J/Cbf11/Cbf12, DNA binding", IPR015351) does not match in these isoforms:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter(ensembl_transcript_id %in% c("ENST00000509158", "ENST00000514807")) %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(!ensembl_transcript_id %in% c("ENST00000509158", "ENST00000514807")))
+```
+
+10. In a short isoform ENST00000488107 of TFDP2 gene from the E2F family, remove the "Winged helix-like DNA-binding domain superfamily" (IPR036388) match, because "E2F/DP family, winged-helix DNA-binding domain" (E2F DBD, IPR003316) does not match in this isoform, and the IPR036388 match does not exactly correspond to a would-be E2F DBD fragment, according to the sequence and matches in longer isoforms; IPR036388 is the only match in ENST00000488107:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter(ensembl_transcript_id == "ENST00000488107") %>% 
+  mutate_at(setdiff(names(tf_coding_transcripts_final_ens99_with_fam_names),
+                    c("protein_accession",
+                      "seq_md5",
+                      "seq_len",
+                      "ensembl_gene_id",
+                      "ensembl_transcript_id",
+                      "DBD",
+                      "humantfs_gene_name")),
+            function(x) { x = NA }) %>% 
+  distinct() %>%
+  bind_rows(tf_coding_transcripts_final_ens99_with_fam_names %>%
+              filter(ensembl_transcript_id != "ENST00000488107"))
+```
+
+11. In a short isoform ENST00000587646 of STAT5A gene from the STAT family, remove the "p53-like transcription factor, DNA-binding" (IPR008967) match, because it is very general and does not correspond to a would-be match of the STAT DBD ("STAT transcription factor, DNA-binding", IPR013801), according to the sequence and matches in longer isoforms (for example, in STAT5A-201, ENST00000345506):
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR008967") | 
+         (ensembl_transcript_id != "ENST00000587646"))
+```
+
+12. Some domain matches are most probably disrupted, so we need to make them whole matches:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+  tf_coding_transcripts_final_ens99_with_fam_names %>%
+  # Make two parts of a disrupted Forkhead domain one match
+  # Transcript: ENST00000376197
+  mutate(start = ifelse((ensembl_transcript_id == "ENST00000376197") &
+                        (ipr_accession == "IPR001766"),
+                        287,
+                        start),
+         stop = ifelse((ensembl_transcript_id == "ENST00000376197") &
+                       (ipr_accession == "IPR001766"),
+                       422,
+                       stop),
+         evalue = ifelse((ensembl_transcript_id == "ENST00000376197") &
+                         (ipr_accession == "IPR001766"),
+                         NA,
+                         evalue)) %>%
+  # Transcript: ENST00000557224
+  mutate(start = ifelse((ensembl_transcript_id == "ENST00000557224") &
+                        (ipr_accession == "IPR001766"),
+                        302,
+                        start),
+         stop = ifelse((ensembl_transcript_id == "ENST00000557224") &
+                       (ipr_accession == "IPR001766"),
+                       437,
+                       stop),
+         evalue = ifelse((ensembl_transcript_id == "ENST00000557224") &
+                         (ipr_accession == "IPR001766"),
+                         NA,
+                         evalue)) %>%
+  # Make two parts of a disrupted COE domain one match
+  mutate(start = ifelse((ensembl_transcript_id == "ENST00000380654") &
+                        (ipr_accession == "IPR032200"),
+                        18,
+                        start),
+         stop = ifelse((ensembl_transcript_id == "ENST00000380654") &
+                       (ipr_accession == "IPR032200"),
+                       223,
+                       stop),
+         evalue = ifelse((ensembl_transcript_id == "ENST00000380654") &
+                         (ipr_accession == "IPR032200"),
+                         NA,
+                         evalue)) %>%
+  # Make two parts of a disrupted POU-specific domain one match
+  # Transcript: ENST00000403058
+  mutate(start = ifelse((ensembl_transcript_id == "ENST00000403058") &
+                        (ipr_accession == "IPR000327"),
+                        480,
+                        start),
+         stop = ifelse((ensembl_transcript_id == "ENST00000403058") &
+                       (ipr_accession == "IPR000327"),
+                       586,
+                       stop),
+         evalue = ifelse((ensembl_transcript_id == "ENST00000403058") &
+                         (ipr_accession == "IPR000327"),
+                         NA,
+                         evalue)) %>%
+  # Transcript: ENST00000518318
+  mutate(start = ifelse((ensembl_transcript_id == "ENST00000518318") &
+                        (ipr_accession == "IPR000327"),
+                        509,
+                        start),
+         stop = ifelse((ensembl_transcript_id == "ENST00000518318") &
+                       (ipr_accession == "IPR000327"),
+                       615,
+                       stop),
+         evalue = ifelse((ensembl_transcript_id == "ENST00000518318") &
+                         (ipr_accession == "IPR000327"),
+                         NA,
+                         evalue)) %>%
+  distinct()
+```
+
+13. Restore some relevant DBD matches lost during hierarchical filtering:
+
+1) AT hook (IPR017956, SMART) in BAZ2A (ENST00000379441, ENST00000549884, ENST00000551812).
+2) C2H2C ZF (IPR002515, Pfam) in ST18 (ENST00000276480).
+3) C2H2C ZF (IPR002515, Pfam) in MYT1L.
+
+Implementation:
+
+```{r, include=T}
+ips_domains_ipr_ens99_int_specific_retained = readRDS(ips_domains_ipr_ens99_int_specific_retained_name)
+
+humantfs = as_tibble(read.csv(file = gunzip(humantfs_name), 
+                              header = T, 
+                              row.names = 1))
+
+domain_classification_wb = loadWorkbook(domain_classification_wb_name)
+
+domain_classification_table = readWorksheet(domain_classification_wb, sheet = "domain_table_manually_annotated", header = TRUE)
+
+tf_coding_transcripts_final_ens99_with_fam_names = 
+  
+  tf_coding_transcripts_final_ens99_with_fam_names %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+              filter((ensembl_transcript_id %in% c("ENST00000379441", "ENST00000549884", "ENST00000551812")) & (ipr_accession == "IPR017956") & (db == "SMART")) %>%
+              mutate(DBD = "AT hook; MBD", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+              left_join(domain_classification_table, 
+                        by = c("ipr_accession" = "ipr_accession",
+                               "ipr_description" = "ipr_description",
+                               "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+              dplyr::select(-category) %>%
+              mutate(start = as.character(start)) %>%
+              mutate(stop = as.character(stop))) %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+              filter((ensembl_transcript_id == "ENST00000276480") & (ipr_accession == "IPR002515") & (db == "Pfam")) %>%
+              mutate(DBD = "C2H2 ZF", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+              left_join(domain_classification_table, 
+                        by = c("ipr_accession" = "ipr_accession",
+                               "ipr_description" = "ipr_description",
+                               "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+              dplyr::select(-category) %>%
+              mutate(start = as.character(start)) %>%
+              mutate(stop = as.character(stop))) %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+              filter((ensembl_gene_id == "ENSG00000186487") & (ipr_accession == "IPR002515") & (db == "Pfam")) %>%
+              mutate(DBD = "C2H2 ZF", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+              left_join(domain_classification_table, 
+                        by = c("ipr_accession" = "ipr_accession",
+                               "ipr_description" = "ipr_description",
+                               "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+              dplyr::select(-category) %>%
+              mutate(start = as.character(start)) %>%
+              mutate(stop = as.character(stop))) %>%
+  
+  filter((ensembl_gene_id != "ENSG00000186487") | (ipr_accession != "IPR036060"))
+```
+
+14. Exclude InterPro entries and signatures that are integrated by mistake (as I clarified with InterPro support team):
+
+1) IPR037220 is not a "Zinc finger BED domain" and will be unintegrated from InterPro in v82.0.
+
+2) Signature SM00614 from IPR003656 ("Zinc finger, BED-type") does not correspond to a BED ZF, because, according to the InterPro support team, it overhits many proteins, in comparison to other signatures intergrated in this entry. Signature SM00614 will be unitegrated from InterPro in v82.0.
+
+Implementation:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = 
+  tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter((ipr_accession != "IPR037220") | is.na(ipr_accession)) %>% 
+  filter((ipr_accession != "IPR003656") | (domain_accession != "SM00614") | is.na(ipr_accession))
+```
+
+Number of genes: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+The number of genes and the number of isoforms stay the same, which is correct. Additionally, the number of isoforms with matches declined a little, while the number of isoforms without matches increased by the same number, which is also correct. Finally, the numbers of InterPro entry matches, unique InterPro entries, specific and general matches declined, which is expected.
+
+# Remove general DBD matches
+
+We still have specific and general InterPro entry matches in our data (see the stats above).
+
+By definition, a specific match does not have or overlap its children (if any) from the InterPro hierarchy in the same isoform. If a match is not specific, it is called general.
+
+Let us check if all general DBD matches overlap with more specific DBD matches:
+
+```{r, include=T}
+compareNA = function(v1, v2) {
+    same = (v1 == v2) | (is.na(v1) & is.na(v2))
+    same[is.na(same)] = F
+    return(same)
+}
+
+is_i_ancestor_for_j = function(ipr_hierarchy, i_accession, j_accession) {
+  i_node = FindNode(ipr_hierarchy, i_accession)
+
+  if (!is.null(i_node)) {
+    i_node_t = Traverse(i_node)
+
+    i_node_succ = unlist(lapply(seq_along(i_node_t), function(i) {i_node_t[[i]]$name}))
+
+    return(j_accession %in% i_node_succ)
+  } else {
+    return(F)
+  }
+}
+
+generate_overlap_table = function(ipr_hierarchy,
+                                  ensembl_gene_id,
+                                  ipr_accession,
+                                  ipr_description,
+                                  start, 
+                                  stop, 
+                                  ipr_status, 
+                                  domain_type, 
+                                  represents_family) {
+  match_df = data.frame(ensembl_gene_id = as.character(ensembl_gene_id),
+                        ipr_accession = as.character(ipr_accession),
+                        ipr_description = as.character(ipr_description),
+                        start = as.numeric(start),
+                        stop = as.numeric(stop),
+                        ipr_status = as.character(ipr_status),
+                        domain_type = as.character(domain_type),
+                        represents_family = as.character(represents_family),
+                        stringsAsFactors = FALSE)
+  
+  overlap_table = data.frame(ensembl_gene_id = "",
+                             ipr_accession = "",
+                             start = "",
+                             stop = "",
+                             overlap_ipr_accession = "", 
+                             overlap_ipr_description = "", 
+                             overlap_ipr_status = "",
+                             overlap_domain_type = "",
+                             overlap_represents_family = "",
+                             overlap_start = "",
+                             overlap_stop = "")
+  
+  for (i in 1:nrow(match_df)) {
+    i_ensembl_gene_id = match_df[i, "ensembl_gene_id"]
+
+    i_ipr_accession = match_df[i, "ipr_accession"]
+
+    i_ipr_status = match_df[i, "ipr_status"]
+
+    i_domain_type = match_df[i, "domain_type"]
+
+    i_start = match_df[i, "start"]
+
+    i_stop = match_df[i, "stop"]
+
+    i_represents_family = match_df[i, "represents_family"]
+
+    if (!compareNA(i_ipr_status, "general") | 
+        !compareNA(i_domain_type, "DBD") | 
+        is.na(i_represents_family)) {
+      overlap_table = overlap_table %>%
+        bind_rows(c(ensembl_gene_id = i_ensembl_gene_id,
+                    ipr_accession = i_ipr_accession,
+                    start = i_start,
+                    stop = i_stop,
+                    overlap_ipr_accession = "", 
+                    overlap_ipr_description = "",
+                    overlap_ipr_status = "",
+                    overlap_domain_type = "",
+                    overlap_represents_family = "",
+                    overlap_start = "",
+                    overlap_stop = ""))
+    
+      next
+    }
+
+    i_overlaps = F
+
+    for (j in 1:nrow(match_df)) {
+      if (j == i) {
+        next
+      }
+
+      j_ipr_accession = match_df[j, "ipr_accession"]
+
+      j_ipr_description = match_df[j, "ipr_description"]
+
+      j_domain_type = match_df[j, "domain_type"]
+
+      j_start = match_df[j, "start"]
+
+      j_stop = match_df[j, "stop"]
+
+      j_ipr_status = match_df[j, "ipr_status"]
+
+      j_represents_family = match_df[j, "represents_family"]
+
+      overlap_length = min(i_stop, j_stop) - max(i_start, j_start)
+
+      if (overlap_length > 0) {
+        i_overlaps = T
+
+        overlap_table = overlap_table %>%
+          bind_rows(c(ensembl_gene_id = i_ensembl_gene_id,
+                      ipr_accession = i_ipr_accession,
+                      start = i_start,
+                      stop = i_stop,
+                      overlap_ipr_accession = j_ipr_accession, 
+                      overlap_ipr_description = j_ipr_description,
+                      overlap_ipr_status = j_ipr_status,
+                      overlap_domain_type = j_domain_type,
+                      overlap_represents_family = j_represents_family,
+                      overlap_start = j_start,
+                      overlap_stop = j_stop))
+      }
+    }
+
+    if (!i_overlaps) {
+      overlap_table = overlap_table %>%
+        bind_rows(c(ensembl_gene_id = i_ensembl_gene_id,
+                    ipr_accession = i_ipr_accession,
+                    start = i_start,
+                    stop = i_stop,
+                    overlap_ipr_accession = "", 
+                    overlap_ipr_description = "", 
+                    overlap_ipr_status = "",
+                    overlap_domain_type = "",
+                    overlap_represents_family = "",
+                    overlap_start = "",
+                    overlap_stop = ""))
+    }
+  }
+
+  overlap_table = overlap_table[-1,]
+
+  return(overlap_table)
+}
+
+general_dbd_overlap_table = tf_coding_transcripts_final_ens99_with_fam_names %>%
+  group_by(ensembl_transcript_id) %>%
+  do(left_join(., generate_overlap_table(ipr_hierarchy, 
+                                         .$ensembl_gene_id,
+                                         .$ipr_accession,
+                                         .$ipr_description,
+                                         .$start,
+                                         .$stop,
+                                         .$ipr_status,
+                                         .$domain_type,
+                                         .$represents_family),
+               by = c("ensembl_gene_id" = "ensembl_gene_id", 
+                      "ipr_accession" = "ipr_accession", 
+                      "start" = "start", 
+                      "stop" = "stop"))) %>%
+  ungroup()
+
+general_dbd_overlap_table = general_dbd_overlap_table %>%
+  mutate(start = as.character(start)) %>%
+  mutate(stop = as.character(stop)) %>%
+  mutate(overlap_start = as.character(overlap_start)) %>%
+  mutate(overlap_stop = as.character(overlap_stop)) %>%
+  mutate(overlap_start = ifelse(is.na(overlap_start), "", overlap_start)) %>%
+  mutate(overlap_stop = ifelse(is.na(overlap_stop), "", overlap_stop)) %>%
+  mutate(category_content_comment = as.character(category_content_comment)) %>%
+  mutate(represents_family = as.character(represents_family)) %>%
+  mutate(overlap_represents_family = as.character(overlap_represents_family))
+
+kable(general_dbd_overlap_table %>%
+      filter(ipr_status == "general") %>%
+      filter(domain_type == "DBD") %>%
+      filter(!is.na(represents_family)) %>%
+      filter(!compareNA(represents_family, overlap_represents_family)) %>%
+      dplyr::select(ensembl_gene_id, 
+                    humantfs_gene_name, 
+                    ensembl_transcript_id, 
+                    DBD, 
+                    ipr_accession, 
+                    ipr_description, 
+                    start, 
+                    stop, 
+                    represents_family, 
+                    overlap_represents_family, 
+                    overlap_ipr_accession, 
+                    overlap_ipr_description, 
+                    overlap_ipr_status, 
+                    overlap_domain_type, 
+                    overlap_start, 
+                    overlap_stop) %>%
+      arrange(ensembl_gene_id, ensembl_transcript_id, ipr_accession)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Hence, general DBD matches, not overlapped by other matches representing the same family, are overlapped by domains of a different specific type, and so we retain the more specific matches as they could be more functionally relevant (we will correct this later, during the curation of TF families, if necessary).
+
+The only exception are Nuclear receptor ZF DBD matches in VDR: they do not overlap with any other domains. So we just need to make them specific:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = tf_coding_transcripts_final_ens99_with_fam_names %>%
+  mutate(ipr_status = ifelse((ensembl_gene_id == "ENSG00000111424") &
+                             (ensembl_transcript_id %in% c("ENST00000395324",
+                                                           "ENST00000546653",
+                                                           "ENST00000549336",
+                                                           "ENST00000550325")) &
+                             (ipr_accession == "IPR001628"),
+                             "specific",
+                             ipr_status))
+```
+
+Now, we can remove general DBD matches:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names = tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter(is.na(ipr_accession) | (domain_type != "DBD") | (ipr_status != "general"))
+```
+
+Number of genes: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99_with_fam_names %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+The numbers of genes, isoforms, isoforms with and without matches stay the same, which is correct. On the other hand, the numbers of InterPro entry matches, signature matches and unique InterPro entries decreased, which is expected. Finally, the total number of general matches decreased and the number of general DBD matches turned into zero, which is also expected; on the other hand, the numbers of specific matches slightly increased, because we turned the general matches without overlaps into specific.
+
+# Deduplicate DBD matches
+
+Next, check if there are overlapping specific DBD matches and in each overlap select the longest match (we do not want to count the same DBD multiple times if it is matched by slightly different InterPro entries):
+
+```{r, include=T}
+calc_overlap_result = function(start, stop) {
+  results = c()
+
+  all_coords = data.frame(start = start,
+                          stop = stop)
+
+  for (i in 1:nrow(all_coords)) {
+    i_start = all_coords[i, "start"]
+
+    i_stop = all_coords[i, "stop"]
+
+    i_length = i_stop - i_start
+
+    j_length_max = 0
+
+    for (j in 1:nrow(all_coords)) {
+      if (j == i) {
+        next
+      }
+
+      j_start = all_coords[j, "start"]
+
+      j_stop = all_coords[j, "stop"]
+
+      j_length = j_stop - j_start
+
+      if (min(i_stop, j_stop) - max(i_start, j_start) > 0) {
+        if (j_length > j_length_max) {
+          j_length_max = j_length
+        }
+      }
+    }
+
+    results = c(results, str_c(c(j_length_max,
+                                 i_length), 
+                               collapse = "|"))
+  }
+
+  return(results)
+}
+
+selected_overlapping_dbds = tf_coding_transcripts_final_ens99_with_fam_names %>%
+  filter(domain_type == "DBD") %>%
+  mutate(start = as.numeric(start)) %>%
+  mutate(stop = as.numeric(stop)) %>% 
+  group_by(ensembl_transcript_id) %>%
+  mutate(overlap_result = calc_overlap_result(start, stop)) %>%
+  mutate(overlapping_max_length = t(as.data.frame(str_split(overlap_result, fixed("|"))))[,1]) %>%
+  mutate(self_length = t(as.data.frame(str_split(overlap_result, fixed("|"))))[,2]) %>%
+  ungroup() %>%
+  dplyr::select(-overlap_result) %>% 
+  filter(as.numeric(self_length) >= as.numeric(overlapping_max_length))
+```
+
+Check if we have overlapping DBDs of exactly same length:
+
+```{r, include=T}
+kable(selected_overlapping_dbds %>%
+        filter(as.numeric(overlapping_max_length) == as.numeric(self_length)) %>%
+        dplyr::select(humantfs_gene_name,
+                      ensembl_gene_id,
+                      ensembl_transcript_id,
+                      ipr_accession,
+                      ipr_description,
+                      start,
+                      stop,
+                      overlapping_max_length,
+                      self_length) %>%
+        arrange(ensembl_gene_id,
+                ensembl_transcript_id,
+                start,
+                stop)) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+Yes, we do. So let us retain one match from the two overlapping ones. Let it be IPR041042 as a more specific-looking one:
+
+```{r, include=T}
+selected_overlapping_dbds = selected_overlapping_dbds %>%
+  filter((ensembl_transcript_id != "ENST00000323684") | 
+         (ipr_accession != "IPR013087") | 
+         (start != 112) |
+         (stop != 143))
+```
+
+Let us combine the whole table:
+
+```{r, include=T}
+selected_overlapping_dbds = selected_overlapping_dbds %>%
+  dplyr::select(-overlapping_max_length, -self_length)
+
+selected_unknown_others = tf_coding_transcripts_final_ens99_with_fam_names %>% 
+  filter(is.na(domain_type) | (domain_type != "DBD")) %>%
+  mutate(start = as.numeric(start)) %>%
+  mutate(stop = as.numeric(stop))
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = selected_overlapping_dbds %>%
+  bind_rows(selected_unknown_others)
+```
+
+Number of genes: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+The number of genes, the total number of isoforms, the numbers of isoforms with and without matches did not change, which is correct. The numbers of InterPro entry matches, signature matches, unique InterPro entries and specific matches has decreased, which is expected. Finally, the numbers of general matches stayed the same, which is also correct.
+
+The corrected table has `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(domain_type == "DBD") %>% nrow()` DBD signature matches (hence, `r (tf_coding_transcripts_final_ens99_with_fam_names %>% filter(domain_type == "DBD") %>% nrow()) - (tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(domain_type == "DBD") %>% nrow())` DBD signature matches were filtered out in overlaps).
+
+```{r}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.prev = tf_coding_transcripts_final_ens99_with_fam_names_corrected
+```
+
+# Classify DBDs into canonical and noncanonical
+
+We call a DBD "canonical" if at least one TF family is described on the basis of its presence. Otherwise, we call a DBD "noncanonical". I manually grouped DBD-related InterPro entries that represent the same TF family. Based on this grouping, we can classify DBDs into canonical and noncanonical.
+
+Canonical DBD InterPro entries and the TF families they represent are:
+
+```{r, include=T}
+kable(tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+        filter(!is.na(represents_family)) %>%
+        dplyr::select(ipr_accession, 
+                      ipr_description, 
+                      represents_family) %>%
+        arrange(represents_family, ipr_accession) %>%
+        distinct()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+The number of TF families these entries represent is `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(represents_family)) %>% pull(represents_family) %>% unique() %>% length()`. It is less than the number of TF families that we have from HumanTFs (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(DBD) %>% unique() %>% length()`), because HumanTFs has combined families (they are described based on the presence of more than one DBD).
+
+Let us store the canonical DBD InterPro entries:
+
+```{r, include=T}
+canonical_dbd_iprs = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  filter(!is.na(represents_family)) %>%
+  dplyr::select(ipr_accession, ipr_description, represents_family) %>%
+  arrange(represents_family, ipr_accession) %>%
+  distinct() %>%
+  pull(ipr_accession)
+```
+
+Noncanonical DBD InterPro entries (these domains can have other functions, apart from putative DNA binding, however, I prioritised their possible DNA binding role):
+
+```{r, include=T}
+kable(tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+        filter((domain_type == "DBD") & is.na(represents_family)) %>%
+        dplyr::select(ipr_accession, 
+                      ipr_description, 
+                      represents_family) %>%
+        arrange(represents_family, ipr_accession) %>%
+        distinct()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+Winged helix(-like) DBD superfamilies are, of course, a well known type of DBD fold, but it is very general and does not correspond to any particular family. That is why it is among noncanonical DBDs.
+
+Let us store the noncanonical DBD InterPro entries:
+
+```{r, include=T}
+noncanonical_dbd_iprs = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  filter((domain_type == "DBD") & is.na(represents_family)) %>%
+  dplyr::select(ipr_accession, ipr_description, represents_family) %>%
+  arrange(represents_family, ipr_accession) %>%
+  distinct() %>%
+  pull(ipr_accession)
+```
+
+Overall, there are `r canonical_dbd_iprs %>% length()` InterPro entries for canonical DBDs and `r noncanonical_dbd_iprs %>% length()` InterPro entries for noncanonical DBDs. The number of canonical DBD entries is greater than the number of TF families (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(DBD) %>% unique() %>% length()`), because some DBD types can be represented by several InterPro entries.
+
+# Curate TF families
+
+Currently, we have `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(DBD) %>% unique() %>% length()` TF families (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!stringr::str_detect(DBD, ";")) %>% filter(!DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()` of them are monotypical, i. e. are defined based on one DBD type, and `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(stringr::str_detect(DBD, ";")) %>% pull(DBD) %>% unique() %>% length()` are combined, i. e. defined based on the presence of several DBD types, and `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()` is technical: "Unknown").
+
+Let us check (and possibly curate) the assignment of TFs to families. Let Fam be a family to which a TF belongs according to HumanTFs (DBD column in the tf_coding_transcripts_final_ens99_with_fam_names_corrected table) and Post be a family to which it should belong according to the DBDs contained in its isoforms after the filtering and corrections. Then our strategy is as follows:
+
+1) (Fam == Post) => no curation is necessary;
+
+2) (Fam != Post) => check DBD matches before filtering and corrections and take actions accordingly.
+
+Implementation:
+
+```{r, include=T}
+order_family_name = function(family_name) {
+  dbd_type_vector = unlist(stringr::str_split(family_name, fixed("; ")))
+
+  return(paste(unique(dbd_type_vector[order(dbd_type_vector)]), collapse="; "))
+}
+
+create_family_name = function(represents_family) {
+  family_vector_ordered = unique(represents_family[order(represents_family)])
+
+  family_vector_nona = family_vector_ordered[!is.na(family_vector_ordered)]
+
+  return(paste(family_vector_nona, collapse="; "))
+}
+
+tf_curation_table = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  dplyr::select(DBD, 
+                ensembl_gene_id, 
+                humantfs_gene_name,
+                ensembl_transcript_id, 
+                ipr_accession, 
+                ipr_description,
+                represents_family) %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., DBD_ordered = order_family_name(.$DBD))) %>%
+  do(mutate(., represents_family_ordered = create_family_name(.$represents_family))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, DBD_ordered, represents_family_ordered) %>%
+  distinct() %>%
+  arrange(ensembl_gene_id)
+```
+
+Now we can use this table to curate the TF assignment to families.
+
+First of all, let us check if proteins from the Unknown family have any canonical DBDs (by the definition of the family, they should not).
+
+```{r, include=T}
+kable(tf_curation_table %>%
+        filter(DBD_ordered == "Unknown") %>%
+        pull(represents_family_ordered) %>%
+        unique()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+No, the Unknown family does not have any proteins with canonical DBD matches.
+
+Next, let us look at the TFs not from the Unknown family, but still without canonical DBD matches. To make sure that we do not miss canonical DBD matches, we need to check the original scanning results for these genes (the results that were obtained before filtering and corrections):
+
+```{r, include=T}
+tf_domain_table_before_filtering = ips_domains_ipr_ens99_int_specific_retained %>%
+  group_by(ensembl_gene_id) %>%
+  arrange(ipr_accession) %>%
+  dplyr::select(ipr_accession, ipr_description) %>%
+  distinct() %>%
+  do(mutate(., desc_combination = str_c(.$ipr_description, collapse = "_"))) %>%
+  do(mutate(., ipr_combination = str_c(.$ipr_accession, collapse = "_"))) %>%
+  dplyr::select(-ipr_accession, -ipr_description) %>%
+  distinct() %>%
+  ungroup()
+
+kable(tf_curation_table %>%
+  filter(DBD_ordered != "Unknown") %>%
+  filter(represents_family_ordered == "") %>%
+  arrange(DBD_ordered) %>%
+  left_join(tf_domain_table_before_filtering,
+            by = "ensembl_gene_id")) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+Let us restore the following matches:
+
+1) C2H2 ZF (IPR036236) in KIN (ENSG00000151657).
+
+2) C2H2C ZF (IPR002515) in MYT1 (ENSG00000196132).
+
+3) RHD DBD (IPR011539) and remove "Proto-oncogene c-Rel, RHD, N-terminal subdomain" (IPR042845) in REL (ENSG00000162924).
+
+4) "Tesmin/TSO1-like CXC domain" (IPR033467) and remove the CRC domain (IPR005172) in LIN54 (ENSG00000189308).
+
+Implementation:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = 
+  
+  tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% 
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+            filter((ensembl_gene_id == "ENSG00000151657") & (ipr_accession == "IPR036236") & (db == "SUPERFAMILY")) %>%
+            mutate(DBD = "C2H2 ZF", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)),  domain_type = "DBD", ipr_status = "specific") %>%
+            left_join(domain_classification_table, 
+                      by = c("ipr_accession" = "ipr_accession",
+                             "ipr_description" = "ipr_description",
+                             "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+            dplyr::select(-category)) %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+            filter((ensembl_gene_id == "ENSG00000196132") & (ipr_accession == "IPR002515") & (db == "Pfam")) %>%
+            mutate(DBD = "C2H2 ZF", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+            left_join(domain_classification_table, 
+                      by = c("ipr_accession" = "ipr_accession",
+                             "ipr_description" = "ipr_description",
+                             "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+            dplyr::select(-category)) %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+            filter((ensembl_gene_id == "ENSG00000162924") & (ipr_accession == "IPR011539") & (db == "ProSiteProfiles")) %>%
+            mutate(DBD = "Rel", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+            left_join(domain_classification_table, 
+                      by = c("ipr_accession" = "ipr_accession",
+                             "ipr_description" = "ipr_description",
+                             "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+            dplyr::select(-category)) %>%
+  
+  filter((ensembl_gene_id != "ENSG00000162924") | (ipr_accession != "IPR042845")) %>%
+  
+  bind_rows(ips_domains_ipr_ens99_int_specific_retained %>%
+            filter((ensembl_gene_id == "ENSG00000189308") & (ipr_accession == "IPR033467") & (db == "SMART")) %>%
+            mutate(DBD = "TCR/CxC", humantfs_gene_name = (humantfs %>% mutate(Ensembl.ID = as.character(Ensembl.ID)) %>% filter(Ensembl.ID == unique(ensembl_gene_id)) %>% pull(HGNC.symbol)), domain_type = "DBD", ipr_status = "specific") %>%
+            left_join(domain_classification_table, 
+                      by = c("ipr_accession" = "ipr_accession",
+                             "ipr_description" = "ipr_description",
+                             "ENTRY_TYPE" = "ENTRY_TYPE")) %>%
+            dplyr::select(-category)) %>%
+  
+  filter((ensembl_gene_id != "ENSG00000189308") | (ipr_accession != "IPR005172"))
+```
+
+Add the restored InterPro entries to the list of canonical DBDs, in case they were not there:
+
+```{r, include=T}
+canonical_dbd_iprs = unique(c(canonical_dbd_iprs, "IPR036236", "IPR002515", "IPR011539", "IPR033467"))
+```
+
+Let us also move the following TFs into the Unknown family:
+
+1) ZNF804A (ENSG00000170396) and ZNF804B (ENSG00000182348), as their C2H2 ZF matches (IPR036236, IPR013087) overlap with a dsRNA-binding zinc-finger domain (IPR022755).
+
+2) MYSM1 (ENSG00000162601), as the SANT/Myb domain (IPR001005) in it overlaps with a more specific SANT domain (IPR001005) which in turn is not a DBD, according to the InterPro entry description.
+
+3) SKOR2 (ENSG00000215474), as it has a SAND-like domain (IPR010919), but SAND domain binding motifs (http://jaspar.genereg.net/search?q=sand&collection=all&tax_group=all&tax_id=all&type=all&class=all&family=all&version=all) do not resembl a putative SKOR2 binding motif (http://jaspar.genereg.net/matrix/UN0136.1/), and additionally SKOR2 has a SKI-like DBD which does not correspond to any family in our analysis.
+
+Implementation:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = 
+  tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  mutate(DBD = ifelse(ensembl_gene_id == "ENSG00000170396", "Unknown", DBD)) %>%
+  mutate(DBD = ifelse(ensembl_gene_id == "ENSG00000182348", "Unknown", DBD)) %>%
+  mutate(DBD = ifelse(ensembl_gene_id == "ENSG00000162601", "Unknown", DBD)) %>%
+  mutate(DBD = ifelse(ensembl_gene_id == "ENSG00000215474", "Unknown", DBD))
+```
+
+Let us exclude all other proteins without relevant DBD matches from the analysis. For this, let us put them in a separate technical family "Excluded":
+
+```{r, include=T}
+gene_ids_to_exclude = tf_curation_table %>%
+  filter(DBD_ordered != "Unknown") %>%
+  filter(represents_family_ordered == "") %>%
+  arrange(DBD_ordered) %>%
+  filter(!ensembl_gene_id %in% c("ENSG00000151657", # KIN
+                                 "ENSG00000196132", # MYT1
+                                 "ENSG00000162924", # REL
+                                 "ENSG00000189308", # LIN54
+                                 "ENSG00000170396", # ZNF804A
+                                 "ENSG00000182348", # ZNF804B
+                                 "ENSG00000162601", # MYSM1
+                                 "ENSG00000215474")) %>% # SKOR2
+  pull(ensembl_gene_id)
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = 
+  tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  mutate(DBD = ifelse(ensembl_gene_id %in% gene_ids_to_exclude, "Excluded", DBD))
+```
+
+Next, check if there are TFs that have fewer canonical DBD types than their family implies. For such TFs, check that we did not lose the relevant canonical DBD matches during the filtering and corrections:
+
+```{r, include=T}
+fewer_dbd_types = function(tf_fam_str, tf_dbds_str) {
+  tf_fam = unlist(stringr::str_split(tf_fam_str, fixed("; ")))
+
+  tf_dbds = unlist(stringr::str_split(tf_dbds_str, fixed("; ")))
+
+  if ((length(setdiff(tf_fam, tf_dbds)) > 0) &
+      (length(setdiff(tf_dbds, tf_fam)) == 0)) {
+    return(T)
+  } else {
+    return(F)
+  }
+}
+
+tfs_to_move_table = tf_curation_table %>% 
+  group_by(ensembl_gene_id) %>%
+  do(filter(., fewer_dbd_types(.$DBD_ordered, .$represents_family_ordered))) %>%
+  ungroup() %>%
+  left_join(tf_domain_table_before_filtering,
+            by = "ensembl_gene_id")
+
+kable(tfs_to_move_table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+We did not lose any DBD types during the filtering and corrections, so now we need to move these TFs into families corresponding to the DBDs that are present in them:
+
+```{r, include=T}
+take_represents_family_ordered = function(gene_id) {
+  represents_family_ordered_str = tfs_to_move_table %>%
+    filter(ensembl_gene_id == gene_id) %>%
+    pull(represents_family_ordered)
+
+  return(represents_family_ordered_str)
+}
+
+tfs_to_move_ids = tfs_to_move_table %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = 
+  tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  group_by(ensembl_gene_id) %>%
+  mutate(DBD = ifelse(ensembl_gene_id %in% tfs_to_move_ids,
+                      take_represents_family_ordered(unique(ensembl_gene_id)),
+                      DBD)) %>%
+  ungroup()
+```
+
+Next, check if there are TFs that have more canonical DBD types than their family implies. Move such TFs, if any, to the appropriate families:
+
+```{r, include=T}
+more_dbd_types = function(tf_fam_str, tf_dbds_str) {
+  tf_fam = unlist(stringr::str_split(tf_fam_str, fixed("; ")))
+
+  tf_dbds = unlist(stringr::str_split(tf_dbds_str, fixed("; ")))
+
+  if ((length(setdiff(tf_fam, tf_dbds)) == 0) &
+      (length(setdiff(tf_dbds, tf_fam)) > 0)) {
+    return(T)
+  } else {
+    return(F)
+  }
+}
+
+tfs_to_move_table = tf_curation_table %>% 
+  group_by(ensembl_gene_id) %>%
+  do(filter(., more_dbd_types(.$DBD_ordered, .$represents_family_ordered))) %>%
+  ungroup()
+
+kable(tfs_to_move_table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Move these TFs into families that match their DBD type combinations:
+
+```{r, include = T}
+take_represents_family_ordered = function(gene_id) {
+  represents_family_ordered_str = tfs_to_move_table %>%
+    filter(ensembl_gene_id == gene_id) %>%
+    pull(represents_family_ordered)
+
+  return(represents_family_ordered_str)
+}
+
+tfs_to_move_ids = tfs_to_move_table %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = 
+  tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  group_by(ensembl_gene_id) %>%
+  mutate(DBD = ifelse(ensembl_gene_id %in% tfs_to_move_ids,
+                      take_represents_family_ordered(unique(ensembl_gene_id)),
+                      DBD)) %>%
+  ungroup()
+```
+
+Next, check if we have TFs whose DBDs only partially reflect their family assignment:
+
+```{r, include=T}
+diff_dbd_types = function(tf_fam_str, tf_dbds_str) {
+  tf_fam = unlist(stringr::str_split(tf_fam_str, fixed("; ")))
+
+  tf_dbds = unlist(stringr::str_split(tf_dbds_str, fixed("; ")))
+
+  if (unique(tf_dbds == c(""))) {
+    tf_dbds = c()
+  }
+
+  if ((length(setdiff(tf_fam, tf_dbds)) > 0) &
+      (length(setdiff(tf_dbds, tf_fam)) > 0)) {
+    return(T)
+  } else {
+    return(F)
+  }
+}
+
+tfs_diff_table = tf_curation_table %>% 
+  group_by(ensembl_gene_id) %>%
+  do(filter(., diff_dbd_types(.$DBD_ordered, .$represents_family_ordered))) %>%
+  ungroup() %>%
+  left_join(tf_domain_table_before_filtering,
+            by = "ensembl_gene_id")
+
+kable(tfs_diff_table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+So, we did not lose the missing canonical DBDs due to filtering and corrections, and hence we need to move these TFs to the families corresponding to their present canonical DBDs:
+
+```{r, include=T}
+take_diff_represents_family_ordered = function(gene_id) {
+  represents_family_ordered_str = tfs_diff_table %>%
+    filter(ensembl_gene_id == gene_id) %>%
+    pull(represents_family_ordered)
+
+  return(represents_family_ordered_str)
+}
+
+tfs_diff_to_move_ids = tfs_diff_table %>%
+  pull(ensembl_gene_id)
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  group_by(ensembl_gene_id) %>%
+  mutate(DBD = ifelse(ensembl_gene_id %in% tfs_diff_to_move_ids,
+                      take_diff_represents_family_ordered(unique(ensembl_gene_id)),
+                      DBD)) %>%
+  ungroup()
+```
+
+Finally, let us order DBD names alphabetically in all family names:
+
+```{r, include=T}
+order_family_name = function(family_name) {
+  dbd_type_vector = unlist(stringr::str_split(family_name, fixed("; ")))
+
+  return(paste(unique(dbd_type_vector[order(dbd_type_vector)]), collapse="; "))
+}
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., DBD = order_family_name(.$DBD))) %>%
+  ungroup()
+```
+
+Number of genes: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+The number of genes, the total number of isoforms, the numbers of isoforms with and without matches did not change, which is correct. The numbers of InterPro entry matches, specific InterPro entry matches and specific DBD entry matches increased, because we restored more specific domains then removed. The number of specific DBD entry matches increased more than the overall number of specific InterPro entry matches, because we restored some DBD matches and removed some specific matches of other types (I think that for the same reason the number of DBD signature matches increased). Finally, the numbers of general matches stayed the same, which is correct.
+
+After the curation, we have `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% pull(DBD) %>% unique() %>% length()` TF families (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!stringr::str_detect(DBD, ";")) %>% filter(!DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()` of them are monotypical, i. e. are defined based on one DBD type, and `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(stringr::str_detect(DBD, ";")) %>% pull(DBD) %>% unique() %>% length()` are combined, i. e. defined based on the presence of several DBD types, and `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()` are technical: "Unknown" and "Excluded").
+
+The number of monotypical families decreased as the following families were excluded:
+
+```{r, include=T}
+kable(setdiff(tf_coding_transcripts_final_ens99_with_fam_names_corrected.prev %>%
+          filter(!stringr::str_detect(DBD, ";")) %>% 
+          filter(!DBD %in% c("Unknown", "Excluded")) %>% 
+          pull(DBD) %>% 
+          unique(), 
+        tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+          filter(!stringr::str_detect(DBD, ";")) %>% 
+          filter(!DBD %in% c("Unknown", "Excluded")) %>% 
+          pull(DBD) %>% 
+          unique())) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+MADF was merged with Myb/SANT; mTERF was excluded as there were no DBD matches in the mTERF proteins; and CENPB and Brinker became part of combined families (see below).
+
+Overall, we have the following monotypical families:
+
+```{r, include=T}
+kable(tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+        filter(!stringr::str_detect(DBD, ";")) %>% 
+        filter(!DBD %in% c("Unknown", "Excluded")) %>% 
+        dplyr::select(DBD) %>%
+        arrange(DBD) %>%
+        pull(DBD) %>% 
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+and the following combined families:
+
+```{r}
+kable(tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+        filter(stringr::str_detect(DBD, ";")) %>% 
+        dplyr::select(DBD) %>%
+        arrange(DBD) %>%
+        pull(DBD) %>% 
+        unique()) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Number of TFs in these families: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!DBD %in% c("Unknown", "Excluded")) %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of TF isoforms in these families: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected %>% filter(!DBD %in% c("Unknown", "Excluded")) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+# Filter isoforms by the Transcript Support Level
+
+Finally, let us filter TF isoforms by the [Ensembl transcript flags](https://www.ensembl.org/info/genome/genebuild/transcript_quality_tags.html). We retain only isoforms with the top two highest Transcript Support Levels (TSLs) 1 and 2, as well as isoforms with an undefined TSL (TSL = NA) and isoforms with the MANE Select flag (independently of their TSL). Isoforms with TSL = NA are not necessarily speculative but just were not assessed for TSL. They are produced by pseudogenes, human leukocyte antigens, immunoglobulin genes or T-cell receptors, or contain only one exon. Isoforms with the MANE Select flag exactly match between the Ensembl and RefSeq annotations and consequently are likely to be real and correctly annotated.
+
+```{r, include=T}
+ensg_enst_tsl = read.delim(gunzip(ensg_enst_tsl_name),
+                           stringsAsFactors = F) %>%
+  dplyr::select(ensembl_gene_id,
+                ensembl_transcript_id,
+                transcript_tsl,
+                transcript_mane_select,
+                transcript_gencode_basic,
+                transcript_appris,
+                ccds) %>%
+  arrange(ensembl_gene_id,
+          ensembl_transcript_id)
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl = 
+tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  left_join(ensg_enst_tsl,
+            by = c("ensembl_gene_id" = "ensembl_gene_id",
+                   "ensembl_transcript_id" = "ensembl_transcript_id")) %>%
+  group_by(ensembl_gene_id, ensembl_transcript_id) %>%
+  mutate(transcript_tsl_code = unlist(stringr::str_split(transcript_tsl, fixed(" ")))[1]) %>%
+  ungroup() %>%
+  filter((transcript_tsl_code == "tsl1") | 
+         (transcript_tsl_code == "tsl2") | 
+         (transcript_tsl_code == "tslNA") | 
+         (transcript_mane_select != ""))
+
+write.table(tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl,
+            file = "tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+saveRDS(tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl, 
+        file = "tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl.rds")
+
+write.table(tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl,
+            file = "tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+The `ensg_enst_tsl_99.tsv` table was obtained with the following code:
+
+```{r, include=T, eval=F}
+# Not executed
+ensembl = useEnsembl(biomart = "ensembl",
+                     dataset = "hsapiens_gene_ensembl",
+                     version = "99")
+
+ensg_enst_tsl = getBM(attributes = c("ensembl_gene_id",
+                                     "ensembl_transcript_id",
+                                     "transcript_tsl",
+                                     "transcript_gencode_basic",
+                                     "transcript_appris",
+                                     "transcript_mane_select",
+                                     "ccds"),
+                      filters = "transcript_biotype",
+                      values = "protein_coding",
+                      mart = ensembl)
+
+write.table(ensg_enst_tsl,
+            file = "ensg_enst_tsl_99.tsv",
+            quote = F, sep = "\t", row.names = F)
+```
+
+Let us see which TFs we lost after the isoform filtering:
+
+```{r}
+diff.vector = setdiff(tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+                        filter(DBD != "Unknown") %>%
+                        filter(DBD != "Excluded") %>%
+                        pull(humantfs_gene_name) %>%
+                        unique(),
+                      tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+                        filter(DBD != "Unknown") %>%
+                        filter(DBD != "Excluded") %>%
+                        pull(humantfs_gene_name) %>%
+                        unique())
+
+lost.tf.table = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+  left_join(ensg_enst_tsl,
+            by = c("ensembl_gene_id" = "ensembl_gene_id",
+                   "ensembl_transcript_id" = "ensembl_transcript_id")) %>%
+  group_by(ensembl_gene_id, ensembl_transcript_id) %>%
+  mutate(transcript_tsl_code = unlist(stringr::str_split(transcript_tsl, fixed(" ")))[1]) %>%
+  ungroup() %>%
+  filter(humantfs_gene_name %in% diff.vector) %>%
+  dplyr::select(ensembl_gene_id, 
+                humantfs_gene_name, 
+                DBD, 
+                ensembl_transcript_id, 
+                transcript_tsl,
+                transcript_tsl_code,
+                transcript_mane_select,
+                transcript_gencode_basic,
+                transcript_appris,
+                ccds) %>%
+  dplyr::rename(Family = DBD) %>%
+  arrange(Family, humantfs_gene_name) %>%
+  distinct()
+
+write.table(lost.tf.table,
+            file = "lost_tf_table_tsl1_tsl2_tslNA_mane.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+So we lost those TFs for further analysis (here we do not count proteins lost from the "Unknown" or "Excluded" families):
+
+```{r, include=T}
+kable(diff.vector) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+The majority of them are described very briefly in UniProtKB and GeneCards, and there are only `r length(diff.vector)` of them. So this is fine.
+
+Number of genes: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% pull(ensembl_gene_id) %>% unique() %>% length()`.
+
+Number of isoforms: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms without matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of isoforms with matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(!is.na(db)) %>% pull(ensembl_transcript_id) %>% unique() %>% length()`.
+
+Number of InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(!is.na(db)) %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()`.
+
+Number of signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(!is.na(db)) %>% nrow()`.
+
+Number of DBD signature matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(!is.na(db)) %>% filter(domain_type == "DBD") %>% nrow()`.
+
+Number of unique InterPro entries: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% pull(ipr_accession) %>% unique() %>% length()`.
+
+Number of specific InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(ipr_status == "specific") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(ipr_status == "specific") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of general InterPro entry matches: `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(ipr_status == "general") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` (`r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(ipr_status == "general") %>% filter(domain_type == "DBD") %>% group_by(ensembl_transcript_id) %>% dplyr::select(ipr_accession) %>% distinct() %>% ungroup() %>% pull(ipr_accession) %>% length()` of which are DBD matches).
+
+Number of TF families (total): `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% pull(DBD) %>% unique() %>% length()`.
+
+Number of TF families (monotypical,  i. e. are defined based on one DBD type): `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(!stringr::str_detect(DBD, ";")) %>% filter(!DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()`.
+
+Number of TF families (combined, i. e. defined based on the presence of several DBD types): `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(stringr::str_detect(DBD, ";")) %>% pull(DBD) %>% unique() %>% length()`.
+
+Number of technical families ("Unknown" and "Excluded"): `r tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% filter(DBD %in% c("Unknown", "Excluded")) %>% pull(DBD) %>% unique() %>% length()`.
+
+So, after the isoform filtering, the number of isoforms decreased dramatically, and the vast majority of them now contain domain matches. The number of transcription factors also decreased, but just a little bit. The total number of families, as well as the numbers of monotypical and combined families, stay the same, which is good (we did not lose any families completely).
+
+# Positive control: Check known examples of domain changes in alternative isoforms
+
+Generate a comparison table using Ensembl gene ID:
+
+```{r, include=T}
+compare_transcripts = function(gene_id) {
+  gene_table = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+    filter(ensembl_gene_id == gene_id)
+
+  comparison_table = gene_table %>%
+    dplyr::select(humantfs_gene_name, ensembl_gene_id, ipr_description, ipr_accession, domain_type) %>%
+    distinct()
+
+  gene_transcripts = gene_table %>% 
+    pull(ensembl_transcript_id) %>% 
+    unique()
+
+  for (tx in gene_transcripts) {
+    domain_counts = gene_table %>%
+      filter(ensembl_transcript_id == tx) %>%
+      dplyr::select(ipr_accession) %>%
+      group_by(ipr_accession) %>%
+      mutate(n = n()) %>%
+      distinct()
+
+    domain_counts[tx] = domain_counts$n
+
+    domain_counts = domain_counts %>%
+      dplyr::select(-n)
+
+    comparison_table = comparison_table %>%
+      left_join(domain_counts, by = c("ipr_accession"))
+  }
+
+  comparison_table = comparison_table %>%
+    mutate_at(vars(-c("humantfs_gene_name",
+                      "ensembl_gene_id",
+                      "ipr_description",
+                      "ipr_accession",
+                      "domain_type")), 
+              ~replace(., is.na(.), 0))
+  
+  return(comparison_table)
+}
+```
+
+1) **TEAD4**:
+
+TEAD4-FL is a full isoform with a DBD and a YAP-binding domains; TEAD4-S is a short isoform without DBD but with a YAP-binding domain. TEAD4-FL binds YAP and DNA and promotes Hippo-YAP signalling and hence - tissue growth. TEAD4-S competes with TEAD-FL for YAP binding and cannot bind to DNA, in this way blocking the Hippo-YAP signalling pathway ([Qi et al., 2016](https://www.nature.com/articles/ncomms11840)).
+
+```{r, include=T}
+kable(compare_transcripts("ENSG00000197905")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+TEAD4-S could be represented by ENST00000397122.
+
+2) **REST**:
+
+The full isoform of this TF has 9 C2H2 ZFs, as well as an N-terminal and a C-terminal repressor domains, and represses neurogenesis. However, insertion of an exon specific to neural cells leads to the production of a truncated isoform (REST4) which is unable to bind DNA; REST4 "lacks four zinc fingers and a C-terminal repressor domain, both of which are required for full DNA-binding and repressive activity of REST." Expression of REST4 leads to the activation of REST target genes in neural cells which determines neurogenesis, while expression of the full REST protein inhibits neurogenesis genes ([Raj et al., 2011](https://www.sciencedirect.com/science/article/pii/S1097276511006320?via%3Dihub)).
+
+```{r, include=T}
+kable(compare_transcripts("ENSG00000084093")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Although all isoforms of REST above lack repressor domains, two of these isoforms contain 5 C2H2 ZF matches, like REST4, and two of them contain all 9 matches.
+
+Let us check the original scanning results for this TF to see if they have the repressor domains:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained %>%
+        filter(ensembl_gene_id == "ENSG00000084093") %>%
+        dplyr::select(ipr_accession, ipr_description, db) %>% 
+        arrange(ipr_accession) %>% 
+        distinct()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+No repressor domains either. So these domains (shown in ([Raj et al., 2011](https://www.sciencedirect.com/science/article/pii/S1097276511006320?via%3Dihub)), Fig. 2a) are probably just not represented in InterPro.
+
+3) **CREM**:
+
+The activating isoforms of this TF are transcribed from a GC-rich noninducible promoter P1 and have an activation domain (P-box, or KID, kinase-inducible domain) surrounded by glutamine-rich regions Q1 and Q2 (they may contact basal transcription machinery), and a bZIP DBD (which is also a dimerisation domain). Repressor isoforms produced from the same promoter either lack Q1 and Q2 due to alternative splicing or the P-box and one of the Q-regions - due to alternative translation start usage. Another set of repressors, called ICERs (inducible cAMP early repressors) are transcribed from a cAMP-inducible promoter P2. They completely lack the P-box, as well as Q1 and Q2, but retain, fully or partially, the bZIP DBD. The activation isoforms get activated themselves by phosphorylation of their P-box domain. ICERs have circadian pattern of expression in the pineal gland ([de Cesare and Sassoni-Corsi, 2000](https://pubmed.ncbi.nlm.nih.gov/10697414-transcriptional-regulation-by-cyclic-amp-responsive-factors/)). Switch from inhibitory to activating CREM isoforms regulates spermatogenesis (an activating CREM-tau isoform is expressed only in postmeiotic germ cells ([Delmas et al., 1993](https://pubmed.ncbi.nlm.nih.gov/8114765-induction-of-crem-activator-proteins-in-spermatids-down-stream-targets-and-implications-for-haploid-germ-cell-differentiation/)).
+
+```{r, include=T}
+kable(compare_transcripts("ENSG00000095794")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Although, no isoforms show Q1 and Q2 regions, some of these isoforms can code for the full activation or repressor variants, where both P-box and bZIP domains are present, and some other may code for ICERs - where the P-box is lost. Interestingly, there is also an isoform that has the activation domain but not the DBD. If it is indeed translated, it could get phophorylated and bind cofactors, competing in this way with the full isoform.
+
+Check that we did not lose possible Q1 and Q2 region matches in the filtering procedure:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained %>%
+        filter(ensembl_gene_id == "ENSG00000095794") %>%
+        dplyr::select(ipr_accession, ipr_description, db) %>% 
+        arrange(ipr_accession) %>% 
+        distinct()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+No matches of the Q regions. So probably they are not represented in InterPro.
+
+4) **MZF1**:
+
+It is a transcription activator in hematopoetic cells and transcription repressor in all other cell types. According to a recent review ([Brix et al., 2020](https://www.mdpi.com/2073-4409/9/1/223/htm), Fig. 1), MZF1 has three isoforms. The full one contains an acidic domain (A) involved in transcription activation and protein-protein interactions, a SCAN domain (allows dimerisation), a TAD and 13 zinc-finger domains. A shorter isofom contains only the TAD (or its part) and the zinc-finger domains, while an even shorter one contains only the N-terminal part of the full protein (i. e., A and SCAN). A possible function of the latter isoform has not yet been elucidated.
+
+```{r, include=T}
+kable(compare_transcripts("ENSG00000099326")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")
+```
+
+Although there are no A domains or TADs matched in the MZF1 isoforms, the full and the shortest isoforms are essentially recovered. It is strange that there is no zinc finger-only isoform. However, this should be due to Ensembl annotation properties, because we do not have MZF1 isoforms without any matches where zinc fingers could be lost during the filtration and corection procedures; additionally, all isoforms have the SCAN domain which should be absent in zinc finger-only isoforms.
+
+Let us check that we did not lose A domains and TADs:
+
+```{r, include=T}
+kable(ips_domains_ipr_ens99_int_specific_retained %>%
+        filter(ensembl_gene_id == "ENSG00000099326") %>%
+        dplyr::select(ipr_accession, ipr_description, db) %>% 
+        arrange(ipr_accession) %>% 
+        distinct()) %>%
+kable_styling(bootstrap_options = c("striped", "hover")) %>%
+scroll_box(width = "100%")
+```
+
+No A domain or TAD either. So, they are probably not represented in InterPro.
+
+Overall, known TF isoforms retaining or lacking certain domains are present in the final table.
+
+Write down tables for downstream modules:
+
+```{r, include = T}
+saveRDS(canonical_dbd_iprs,
+        file = "canonical_dbd_iprs.rds")
+```

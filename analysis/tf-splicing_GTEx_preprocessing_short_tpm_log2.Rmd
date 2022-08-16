@@ -1,0 +1,1095 @@
+---
+title: "GTEx data preprocessing"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+   html_document:
+     code_folding: hide
+     collapsed: no
+     fig_align: center
+     fig_caption: yes
+     highlight: haddock
+     keep_md: yes
+     number_sections: yes
+     smooth_scroll: no
+     toc: yes
+     toc_depth: 3
+     toc_float: yes
+---
+
+```{r setup, include=T}
+require("knitr")
+opts_knit$set(root.dir = "/home/rstudio")
+knitr::opts_chunk$set(echo = TRUE)
+stringsAsFactors = F
+
+library(dplyr) 
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(magrittr)
+library(DESeq2)
+library(limma)
+library(tictoc)
+library(kableExtra)
+library(biomaRt)
+library(preprocessCore)
+```
+
+## Load and prepare GTEx data
+
+Load the sample annotation table:
+
+```{r, include=T}
+gtex.annot = read.delim("data/gtex8/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt",
+                        header = T,
+                        sep = "\t",
+                        stringsAsFactors = F)
+head(gtex.annot)
+```
+
+Subset samples for further analysis:
+
+```{r, include=T}
+# Make the subsetting reproducible
+set.seed(127)
+
+gtex.annot.subset = gtex.annot %>%
+  # Select samples from the Analysis Freeze dataset
+  filter(SMAFRZE == "RNASEQ") %>% 
+  # Remove duplicate samples
+  filter(!SMTSD %in% c("Brain - Cerebellar Hemisphere", 
+                       "Brain - Frontal Cortex (BA9)")) %>% 
+  group_by(SMTSD) %>%
+  mutate(sample.number = length(SAMPID)) %>%
+  ungroup() %>%
+  filter(sample.number >= 100) %>% # Remove tissues with a small number of samples
+  # Select 50 random samples for each tissue
+  group_by(SMTSD) %>%
+  dplyr::slice_sample(n = 50) %>% 
+  ungroup()
+```
+
+Load the ID tables of TFs and non-TFs:
+
+```{r, include=T}
+tf.ids = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table.tsv",
+                    header = T,
+                    sep = "\t",
+                    stringsAsFactors = F)
+
+head(tf.ids)
+
+nontf.ids = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table.tsv",
+                        header = T,
+                        sep = "\t",
+                        stringsAsFactors = F)
+
+head(nontf.ids)
+```
+
+Load the isoform TPM table and select samples and isoforms:
+
+```{r, include=T}
+start_time <- Sys.time()
+
+prepend.zero = function(i) {
+  return(ifelse(nchar(as.character(i)) == 1,
+                paste0("00", as.character(i)),
+                ifelse(nchar(as.character(i)) == 2,
+                       paste0("0", as.character(i)),
+                       as.character(i))))
+}
+
+# Generate the header subset
+gtex.tpms.header = read.table(file = "data/gtex8/GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm.tsv",
+                              nrows = 1,
+                              header = F,
+                              sep = "\t",
+                              stringsAsFactors = F)
+names(gtex.tpms.header) = gtex.tpms.header[1, ]
+gtex.tpms.header.to.output = gtex.tpms.header[, names(gtex.tpms.header) %in% c("gene_id",
+                                                                               "transcript_id",
+                                                                               gtex.annot.subset$SAMPID)]
+# Write down the header for the subset table
+write.table(gtex.tpms.header.to.output,
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm.tsv",
+            col.names = F,
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+# Make a list of TF and non-TF isoforms to select
+tf.and.nontf.transcript.ids = unique(c(tf.ids$ensembl_transcript_id, nontf.ids$ensembl_transcript_id))
+
+# Select samples and genes from the table of raw isoform counts
+for (i in 1:200) { # go through the chunks of the raw count file
+  i.str = prepend.zero(i)
+  cat("Part", i.str, "of 200...\n")
+  # Read a chunk
+  gtex.tpms.part = read.table(file = paste0("data/gtex8/GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm_chunks/chunk.", i.str),
+                                    header = F,
+                                    sep = "\t",
+                                    stringsAsFactors = F)
+  names(gtex.tpms.part) = gtex.tpms.header[1, ]
+  # Choose only the samples from the annotation subset
+  gtex.tpms.part = gtex.tpms.part[, names(gtex.tpms.part) %in% c("gene_id",
+                                                                 "transcript_id",
+                                                                 gtex.annot.subset$SAMPID)]
+  # Remove versions from gene and transcript IDs
+  gtex.tpms.part = gtex.tpms.part %>%
+    group_by(gene_id) %>%
+    mutate(gene_id = unlist(strsplit(gene_id, "\\."))[1]) %>%
+    ungroup() %>%
+    group_by(transcript_id) %>%
+    mutate(transcript_id = unlist(strsplit(transcript_id, "\\."))[1]) %>%
+    ungroup()
+  # Select TF and non-TF protein coding transcripts
+  gtex.tpms.part = gtex.tpms.part %>%
+    filter(transcript_id %in% tf.and.nontf.transcript.ids)
+  # Add the resulting part table to the whole resulting table
+  write.table(gtex.tpms.part,
+              file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm.tsv",
+              append = T,
+              col.names = F,
+              quote = F,
+              sep = "\t",
+              row.names = F)
+}
+
+end_time <- Sys.time()
+cat("Elapsed time:", end_time - start_time)
+# ~ 25 min
+
+# Keep all isoforms
+engs_enst_tsl = read.table(file = "data/ensembl99/ensg_enst_tsl_99.tsv",
+                           header = T,
+                           sep = "\t",
+                           stringsAsFactors = F)
+
+coding.transcript.ids = engs_enst_tsl %>%
+  pull(ensembl_transcript_id) %>%
+  unique()
+  
+start_time <- Sys.time()
+
+prepend.zero = function(i) {
+  return(ifelse(nchar(as.character(i)) == 1,
+                paste0("00", as.character(i)),
+                ifelse(nchar(as.character(i)) == 2,
+                       paste0("0", as.character(i)),
+                       as.character(i))))
+}
+
+# Generate the header subset
+gtex.tpms.header = read.table(file = "data/gtex8/GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm.tsv",
+                              nrows = 1,
+                              header = F,
+                              sep = "\t",
+                              stringsAsFactors = F)
+names(gtex.tpms.header) = gtex.tpms.header[1, ]
+gtex.tpms.header.to.output = gtex.tpms.header[, names(gtex.tpms.header) %in% c("gene_id",
+                                                                               "transcript_id",
+                                                                               gtex.annot.subset$SAMPID)]
+# Write down the header for the subset table
+write.table(gtex.tpms.header.to.output,
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_whole.tsv",
+            col.names = F,
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+# Select samples and genes from the table of raw isoform counts
+for (i in 1:200) { # go through the chunks of the raw count file
+  i.str = prepend.zero(i)
+  cat("Part", i.str, "of 200...\n")
+  # Read a chunk
+  gtex.tpms.part = read.table(file = paste0("data/gtex8/GTEx_Analysis_2017-06-05_v8_RSEMv1.3.0_transcript_tpm_chunks/chunk.", i.str),
+                                    header = F,
+                                    sep = "\t",
+                                    stringsAsFactors = F)
+  names(gtex.tpms.part) = gtex.tpms.header[1, ]
+  # Choose only the samples from the annotation subset
+  gtex.tpms.part = gtex.tpms.part[, names(gtex.tpms.part) %in% c("gene_id",
+                                                                 "transcript_id",
+                                                                 gtex.annot.subset$SAMPID)]
+  # Remove versions from gene and transcript IDs
+  gtex.tpms.part = gtex.tpms.part %>%
+    group_by(gene_id) %>%
+    mutate(gene_id = unlist(strsplit(gene_id, "\\."))[1]) %>%
+    ungroup() %>%
+    group_by(transcript_id) %>%
+    mutate(transcript_id = unlist(strsplit(transcript_id, "\\."))[1]) %>%
+    ungroup()
+  # Select protein coding transcripts
+  gtex.tpms.part = gtex.tpms.part %>%
+    filter(transcript_id %in% coding.transcript.ids)
+  # Add the resulting part table to the whole resulting table
+  write.table(gtex.tpms.part,
+              file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_whole.tsv",
+              append = T,
+              col.names = F,
+              quote = F,
+              sep = "\t",
+              row.names = F)
+}
+
+end_time <- Sys.time()
+cat("Elapsed time:", end_time - start_time)
+# ~ 25 min
+```
+
+## Load and transform raw isoform counts
+
+Load the table of TPMs for the selected samples and isoforms:
+
+```{r, include=T}
+selected.table = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm.tsv",
+                            header = T,
+                            sep = "\t",
+                            stringsAsFactors = F)
+
+selected.table.whole = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_whole.tsv",
+                            header = T,
+                            sep = "\t",
+                            stringsAsFactors = F)
+# Hyphens in sample IDs became full stops
+```
+
+Check possible duplicate isoforms:
+
+```{r, include=T}
+cat("The number of duplicate isoform IDs:", 
+    length(selected.table %>% pull(transcript_id)) - length(unique(selected.table %>% pull(transcript_id))),
+    "\n")
+
+duplicated.isoforms = selected.table$transcript_id[duplicated(selected.table$transcript_id)]
+
+cat("The number of duplicate isoform IDs (in the whole table):", 
+    length(selected.table.whole %>% pull(transcript_id)) - length(unique(selected.table.whole %>% pull(transcript_id))),
+    "\n")
+
+duplicated.isoforms.whole = selected.table.whole$transcript_id[duplicated(selected.table.whole$transcript_id)]
+```
+
+So there are `r length(duplicated.isoforms)` duplicated isoforms. Run of the `print_duplicate_isoforms_in_gtex8.sh` script shows that the only kind of duplicated isoforms in GTEx V8 are pseudoautosomal isoforms from X and Y chromosomes. Let us simply remove both copies of the duplicated isoforms:
+
+```{r, include=T}
+selected.table %<>% filter(!transcript_id %in% duplicated.isoforms)
+
+selected.table.whole %<>% filter(!transcript_id %in% duplicated.isoforms.whole)
+```
+
+Let us remove "Cells - Cultured fibroblasts" and "Cells - EBV-transformed lymphocytes," because they are cell cultures and not primary tissues. Let us also remove "Whole Blood" as it may be a very diverse "tissue":
+
+```{r, include=T}
+gtex.annot.subset.filtered = gtex.annot.subset %>%
+  filter(!SMTSD %in% c("Cells - Cultured fibroblasts",
+                       "Cells - EBV-transformed lymphocytes",
+                       "Whole Blood"))
+```
+
+Prepare the table of selected samples and isoforms for the between-sample normalisation:
+
+```{r, include=T}
+selected.table.ann = selected.table %>%
+  dplyr::select(gene_id, transcript_id)
+
+selected.table.whole.ann = selected.table.whole %>%
+  dplyr::select(gene_id, transcript_id)
+
+selected.table %<>% dplyr::select(-gene_id, -transcript_id)
+
+selected.table.whole %<>% dplyr::select(-gene_id, -transcript_id)
+
+row.names(selected.table) = selected.table.ann$transcript_id
+
+row.names(selected.table.whole) = selected.table.whole.ann$transcript_id
+```
+
+Do the between-sample normalisation to be able to compare expression of isoforms across samples and tissues.
+
+```{r, include=T}
+tic("Log2-scaling of isoform TPMs:")
+selected.table.log2 = log2(selected.table + 1)
+toc()
+# ~3 sec
+
+# For all isoforms
+tic("Log2-scaling of all isoform TPMs:")
+selected.table.whole.log2 = log2(selected.table.whole + 1)
+toc()
+# ~3 sec
+```
+
+Write down the table of log2-scaled counts:
+
+```{r, include=T}
+write.table(round(selected.table.log2, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_log2.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+write.table(round(selected.table.whole.log2, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_whole_log2.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+```
+
+## PCA of selected GTEx samples
+
+Prepare functions for PCA:
+
+```{r, include=T}
+explain.variation = function(pca) {
+  pca.summary = summary(pca)
+  pca.pc1.annotation = paste("PC1 (", toString(round(pca.summary$importance[2] * 100, digits=1)), "%)", sep="")
+  pca.pc2.annotation = paste("PC2 (", toString(round(pca.summary$importance[5] * 100, digits=1)), "%)", sep="")
+  return(c(pca.pc1.annotation, pca.pc2.annotation))
+}
+
+draw.pca = function(pca, pcat, coloring) {
+  pc.annotation = explain.variation(pca)
+  pc1.annotation = pc.annotation[1]
+  pc2.annotation = pc.annotation[2]
+  return(ggplot(pcat, aes(x = PC1, y = PC2)) + 
+    geom_point(aes(color = .data[[coloring]])) + 
+    labs(x = pc1.annotation, y = pc2.annotation) +
+    theme_classic() + 
+    theme(legend.title = element_text(.data[[coloring]])))
+}
+
+generate.pca = function(master.table, conditions.table) {
+  pca  = prcomp(t(master.table))
+  pcat = as.data.frame(pca$x[, 1:2])
+  pcat = merge(pcat,
+               conditions.table,
+               by = "row.names")
+  return(list("pca" = pca, "pcat" = pcat))
+}        
+```
+
+Format the full conditions table and make donor and aliquot IDs separate columns in the sample annotation:
+
+```{r, include=T}
+gtex.annot.subset.filtered = gtex.annot.subset.filtered %>%
+  group_by(SAMPID) %>%
+  mutate(SAMPID = stringr::str_replace_all(SAMPID, "-", ".")) %>%
+  ungroup()
+
+sample.id.splits = strsplit(gtex.annot.subset.filtered$SAMPID, "\\.")
+
+gtex.annot.subset.filtered$DONOR = unlist(lapply(sample.id.splits, function(elem) {elem[2]}))
+
+gtex.annot.subset.filtered$ALIQUOT = unlist(lapply(sample.id.splits, function(elem) {elem[5]}))
+
+cat("Number of donors:", length(unique(gtex.annot.subset.filtered$DONOR)), "\n")
+
+cat("Number of aliquotes:", length(unique(gtex.annot.subset.filtered$ALIQUOT)), "\n")
+
+gtex.annot.subset.filtered = as.data.frame(gtex.annot.subset.filtered)
+
+row.names(gtex.annot.subset.filtered) = gtex.annot.subset.filtered$SAMPID
+
+selected.table.log2 = selected.table.log2[, row.names(gtex.annot.subset.filtered)]
+
+selected.table.whole.log2 = selected.table.whole.log2[, row.names(gtex.annot.subset.filtered)]
+
+selected.table = selected.table[, row.names(gtex.annot.subset.filtered)]
+
+selected.table.whole = selected.table.whole[, row.names(gtex.annot.subset.filtered)]
+
+write.table(round(selected.table, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_final.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+write.table(selected.table.log2, # was already rounded before
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_final.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+write.table(round(selected.table.whole, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_whole_final.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+write.table(selected.table.whole.log2, # was already rounded before
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_whole_log2_final.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+write.table(gtex.annot.subset.filtered,
+            file = "data/results/gtex8_processed/gtex_annot_subset_filtered.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+Make a PCA plot based on the transformed isoform counts:
+
+```{r, include=T, fig.width=20, fig.height=10}
+selected.table.log2 = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_final.tsv",
+                                 header = T,
+                                 sep = "\t",
+                                 stringsAsFactors = F)
+
+selected.table.whole.log2 = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_whole_log2_final.tsv",
+                                       header = T,
+                                       sep = "\t",
+                                       stringsAsFactors = F)
+
+pca.list.tpm.log2 = generate.pca(master.table = selected.table.log2,
+                                 conditions.table = gtex.annot.subset.filtered)
+
+p = draw.pca(pca = pca.list.tpm.log2$pca,
+             pcat = pca.list.tpm.log2$pcat,
+             coloring = "SMTSD")
+
+print(p)
+```
+
+PCA on raw TPMs, for comparison:
+
+```{r, include=T, fig.width=20, fig.height=10}
+selected.table = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_tpm_final.tsv",
+                            header = T,
+                            sep = "\t",
+                            stringsAsFactors = F)
+
+pca.list.tpm = generate.pca(master.table = selected.table,
+                            conditions.table = gtex.annot.subset.filtered)
+
+p = draw.pca(pca = pca.list.tpm$pca,
+             pcat = pca.list.tpm$pcat,
+             coloring = "SMTSD")
+
+print(p)
+```
+
+So the log2-scaled TPMs make much more sense.
+
+Overall, we have `r nrow(gtex.annot.subset.filtered)` samples from `r gtex.annot.subset.filtered %>% pull(SMTSD) %>% unique() %>% length()` tissues. We also have the following numbers of TFs and non-TFs:
+
+```{r, include=T}
+tf.d = merge(tf.ids, selected.table.log2, by.x = "ensembl_transcript_id", by.y = "row.names")
+
+cat("TF genes:", tf.d %>% pull(ensembl_gene_id) %>% unique() %>% length(), "\n")
+
+cat("TF isoforms:", nrow(tf.d), "\n")
+
+ntf.d = merge(nontf.ids, selected.table.log2, by.x = "ensembl_transcript_id", by.y = "row.names")
+
+cat("Non-TF genes:", ntf.d %>% pull(ensembl_gene_id) %>% unique() %>% length(), "\n")
+
+cat("Non-TF isoforms:", nrow(ntf.d), "\n")
+```
+
+## Calculate isoform tissue specificity
+
+Calculate median isoform expression:
+
+```{r, include=T}
+# Calculate median transformed isoform count per tissue
+selected.table.log2.med = as.data.frame(lapply(unique(gtex.annot.subset.filtered$SMTSD),
+                                                     function(x) {
+                                                       x.samples = gtex.annot.subset.filtered %>%
+                                                         filter(SMTSD == x) %>%
+                                                         pull(SAMPID)
+                                                       return(rowMedians(as.matrix(selected.table.log2[, x.samples])))
+                                                     }))
+
+raw.tissue.names = unique(gtex.annot.subset.filtered$SMTSD)
+tissue.names = stringr::str_replace_all(raw.tissue.names, " - ", ".")
+tissue.names = stringr::str_replace_all(tissue.names, " ", ".")
+tissue.names = stringr::str_remove_all(tissue.names, "[()]")
+
+names(selected.table.log2.med) = tissue.names
+
+row.names(selected.table.log2.med) = rownames(selected.table.log2)
+
+selected.table.log2.med[1:4, 1:4]
+nrow(selected.table.log2.med)
+ncol(selected.table.log2.med)
+
+# Final transformed count table - medians
+write.table(round(selected.table.log2.med, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+# Calculate median transformed isoform count per tissue (for all isoforms)
+selected.table.whole.log2.med = as.data.frame(lapply(unique(gtex.annot.subset.filtered$SMTSD),
+                                                     function(x) {
+                                                       x.samples = gtex.annot.subset.filtered %>%
+                                                         filter(SMTSD == x) %>%
+                                                         pull(SAMPID)
+                                                       return(rowMedians(as.matrix(selected.table.whole.log2[, x.samples])))
+                                                     }))
+
+raw.tissue.names = unique(gtex.annot.subset.filtered$SMTSD)
+tissue.names = stringr::str_replace_all(raw.tissue.names, " - ", ".")
+tissue.names = stringr::str_replace_all(tissue.names, " ", ".")
+tissue.names = stringr::str_remove_all(tissue.names, "[()]")
+
+names(selected.table.whole.log2.med) = tissue.names
+
+row.names(selected.table.whole.log2.med) = rownames(selected.table.whole.log2)
+
+selected.table.whole.log2.med[1:4, 1:4]
+nrow(selected.table.whole.log2.med)
+ncol(selected.table.whole.log2.med)
+
+# Final transformed count table - medians (for all isoforms)
+write.table(round(selected.table.whole.log2.med, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_whole_log2_med.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+```
+
+Calculate isoform tissue specificity based on the median transformed counts per tissue:
+
+```{r, include=T}
+# Calculate isoform tissue specificity based on median transformed counts
+calc_tissue_specificity = function(gene.count.df) {
+  clean.df = gene.count.df[, !names(gene.count.df) %in% c("ensembl_transcript_id")]
+  max.expression = max(t(clean.df[1, ]))
+  if (max.expression > 0) {
+    expr.to.max = t(clean.df[1, ]) / max.expression
+    tau.score = sum(1 - expr.to.max) / (length(expr.to.max) - 1)
+  } else {
+    tau.score = 0
+  }
+  return(tau.score)
+}
+
+selected.table.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med.tsv",
+                                     header = T,
+                                     sep = "\t",
+                                     stringsAsFactors = F)
+
+selected.table.log2.med$ensembl_transcript_id = rownames(selected.table.log2.med)
+
+selected.table.log2.med.ts = selected.table.log2.med %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., tissue_specificity = calc_tissue_specificity(.))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_transcript_id, tissue_specificity)
+
+selected.table.vsd.med.ts[1:3, ]
+nrow(selected.table.vsd.med.ts)
+ncol(selected.table.vsd.med.ts)
+
+# Isoform tissue specificity table
+write.table(selected.table.log2.med.ts %>%
+              mutate(tissue_specificity = round(tissue_specificity, 4)),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_ts.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+## Select samples and genes for gene-level normalizations
+
+Load the raw gene counts and select samples:
+
+```{r, include=T}
+start_time <- Sys.time()
+
+prepend.zero = function(i) {
+  return(ifelse(nchar(as.character(i)) == 1,
+                paste0("00", as.character(i)),
+                ifelse(nchar(as.character(i)) == 2,
+                       paste0("0", as.character(i)),
+                       as.character(i))))
+}
+
+# Generate the header subset
+gtex.tpms.header = read.table(file = "data/gtex8/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.tsv",
+                              nrows = 1,
+                              header = F,
+                              sep = "\t",
+                              stringsAsFactors = F)
+
+gtex.tpms.header[1, ] = stringr::str_replace_all(gtex.tpms.header[1, ], "-", "\\.")
+names(gtex.tpms.header) = gtex.tpms.header[1, ]
+gtex.tpms.header.to.output = gtex.tpms.header[, names(gtex.tpms.header) %in% c("Name",
+                                                                               "Description",
+                                                                               gtex.annot.subset.filtered$SAMPID)]
+
+# Write down the header for the subset table
+write.table(gtex.tpms.header.to.output,
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_gene_tpm.tsv",
+            col.names = F,
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+# Make a list of TF and non-TF isoforms to select
+tf.and.nontf.gene.ids = unique(c(tf.ids$ensembl_gene_id, nontf.ids$ensembl_gene_id))
+
+# Select samples and genes from the table of raw isoform counts
+for (i in 1:57) { # go through the chunks of the raw count file
+  i.str = prepend.zero(i)
+  cat("Part", i.str, "of 57...\n")
+  # Read a chunk
+  gtex.tpms.part = read.table(file = paste0("data/gtex8/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm_chunks/chunk.", i.str),
+                                            header = F,
+                                            sep = "\t",
+                                            stringsAsFactors = F)
+  names(gtex.tpms.part) = gtex.tpms.header[1, ]
+  # Choose only the samples from the annotation subset
+  gtex.tpms.part = gtex.tpms.part[, names(gtex.tpms.part) %in% c("Name",
+                                                                 "Description",
+                                                                 gtex.annot.subset.filtered$SAMPID)]
+  # Remove versions from gene and transcript IDs
+  gtex.tpms.part = gtex.tpms.part %>%
+    group_by(Name) %>%
+    mutate(Name = unlist(strsplit(Name, "\\."))[1]) %>%
+    ungroup()
+
+  # Select TF and non-TF protein coding transcripts
+  gtex.tpms.part = gtex.tpms.part %>%
+    filter(Name %in% tf.and.nontf.gene.ids)
+  # Add the resulting part table to the whole resulting table
+  write.table(gtex.tpms.part,
+              file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_gene_tpm.tsv",
+              append = T,
+              col.names = F,
+              quote = F,
+              sep = "\t",
+              row.names = F)
+}
+
+end_time <- Sys.time()
+cat("Elapsed time:", end_time - start_time)
+# ~6.5 min
+```
+
+## Transform raw gene counts
+
+Load the table of raw gene counts for the selected samples and genes:
+
+```{r, include=T}
+selected.table.genes = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_gene_tpm.tsv",
+                                  header = T,
+                                  sep = "\t",
+                                  stringsAsFactors = F)
+```
+
+Check possible duplicate genes:
+
+```{r, include=T}
+cat("The number of duplicate gene IDs:", 
+    length(selected.table.genes %>% pull(Name)) - length(unique(selected.table.genes %>% pull(Name))),
+    "\n")
+duplicated.genes = selected.table.genes$Name[duplicated(selected.table.genes$Name)]
+```
+
+Check how many of them are TFs:
+
+```{r, include=T}
+cat("Duplicate TFs: ")
+tf.ids %>% 
+  filter(ensembl_gene_id %in% duplicated.genes) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+cat("\nDuplicate non-TFs: ")
+nontf.ids %>% 
+  filter(ensembl_gene_id %in% duplicated.genes) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+```
+
+The two duplicated TFs are annotated on both X and Y chromosomes (according to Ensembl).
+
+Let us remove the duplicated TFs and non-TFs from the analysis:
+
+```{r, include=T}
+selected.table.genes %<>% filter(!Name %in% duplicated.genes)
+```
+
+Now we have `r length(unique(selected.table.genes$Name))` genes, among which `r tf.ids %>% filter(ensembl_gene_id %in% unique(selected.table.genes$Name)) %>% pull(ensembl_gene_id) %>% unique() %>% length()` are TFs and `r nontf.ids %>% filter(ensembl_gene_id %in% unique(selected.table.genes$Name)) %>% pull(ensembl_gene_id) %>% unique() %>% length()` are non-TFs. This is OK.
+
+Prepare the table of selected samples and genes for the between-sample normalisation:
+
+```{r, include=T}
+selected.table.genes.ann = selected.table.genes %>%
+  dplyr::select(Name, Description)
+
+selected.table.genes %<>% dplyr::select(-Name, -Description)
+
+row.names(selected.table.genes) = selected.table.genes.ann$Name
+```
+
+Do the between-sample normalisation (transformation) to be able to compare expression of genes across samples and tissues:
+
+```{r, include=T}
+tic("Log2-scaling of 2150 GTEx V8 samples, TF and non-TF gene TPMs")
+selected.table.genes.log2 = log2(selected.table.genes + 1)
+toc()
+# ~1 sec
+```
+
+Write down the table of transformed TPMs:
+
+```{r, include=T}
+write.table(round(selected.table.genes.log2, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+```
+
+## Calculate median gene expression in each tissue
+
+Take median expression of each gene in each tissue:
+
+```{r, include=T}
+selected.table.genes.log2.med = as.data.frame(lapply(unique(gtex.annot.subset.filtered$SMTSD),
+                                                     function(x) {
+                                                       x.samples = gtex.annot.subset.filtered %>%
+                                                         filter(SMTSD == x) %>%
+                                                         pull(SAMPID)
+                                                       return(rowMedians(as.matrix(selected.table.genes.log2[, x.samples])))
+                                                     }))
+
+raw.tissue.names = unique(gtex.annot.subset.filtered$SMTSD)
+tissue.names = stringr::str_replace_all(raw.tissue.names, " - ", ".")
+tissue.names = stringr::str_replace_all(tissue.names, " ", ".")
+tissue.names = stringr::str_remove_all(tissue.names, "[()]")
+
+names(selected.table.genes.log2.med) = tissue.names
+
+row.names(selected.table.genes.log2.med) = rownames(selected.table.genes.log2)
+
+write.table(round(selected.table.genes.log2.med, 6),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = T)
+```
+
+## Calculate gene tissue specificity
+
+Use Tau index as a measure of gene tissue specificity:
+
+```{r, include=T}
+calc_tissue_specificity = function(gene.count.df) {
+  clean.df = gene.count.df[, !names(gene.count.df) %in% c("ensembl_gene_id")]
+  max.expression = max(t(clean.df[1, ]))
+  if (max.expression > 0) {
+    expr.to.max = t(clean.df[1, ]) / max.expression
+    tau.score = sum(1 - expr.to.max) / (length(expr.to.max) - 1)
+  } else {
+    tau.score = 0
+  }
+  return(tau.score)
+}
+
+selected.table.genes.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med.tsv",
+                                           header = T,
+                                           sep = "\t",
+                                           stringsAsFactors = F)
+
+selected.table.genes.log2.med$ensembl_gene_id = rownames(selected.table.genes.log2.med)
+
+selected.table.genes.log2.med.ts = selected.table.genes.log2.med %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., tissue_specificity = calc_tissue_specificity(.))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, tissue_specificity)
+
+write.table(selected.table.genes.log2.med.ts %>%
+              mutate(tissue_specificity = round(tissue_specificity, 4)),
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_ts.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+## Get the final list of isoforms
+
+Above, we selected only genes whose transcripts were quantified. Now we need to select only transcripts from the genes present in our analysis (there may be some transcripts whose genes are not present in the gene tables):
+
+```{r, include=T}
+selected.table.genes.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med.tsv",
+                                           header = T,
+                                           sep = "\t",
+                                           stringsAsFactors = F)
+
+selected.table.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med.tsv",
+                                     header = T,
+                                     sep = "\t",
+                                     stringsAsFactors = F)
+
+tf.and.nontf.ids = rbind(tf.ids, nontf.ids)
+
+filtered.transcript.ids = tf.and.nontf.ids %>%
+  filter(ensembl_gene_id %in% rownames(selected.table.genes.log2.med)) %>%
+  pull(ensembl_transcript_id) %>%
+  unique()
+
+write.table(selected.table.log2.med[rownames(selected.table.log2.med) %in% filtered.transcript.ids, ],
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_filtered.tsv", 
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+selected.table.log2.med.ts = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_ts.tsv",
+                                        header = T,
+                                        sep = "\t",
+                                        stringsAsFactors = F)
+
+write.table(selected.table.log2.med.ts[selected.table.log2.med.ts$ensembl_transcript_id %in% filtered.transcript.ids, ],
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_ts_final.tsv", 
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+## Get the final lists of TFs and non-TFs
+
+In the same way, filter lists of TF and non-TF genes:
+
+```{r, include=T}
+selected.table.log2.med.ts = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_ts_final.tsv",
+                                        header = T,
+                                        sep = "\t",
+                                        stringsAsFactors = F)
+
+tf.ids.filtered = tf.ids %>%
+  filter(ensembl_transcript_id %in% selected.table.log2.med.ts$ensembl_transcript_id)
+
+write.table(tf.ids.filtered,
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table_filtered.tsv",
+            quote = F,
+            sep = "\t")
+
+nontf.ids.filtered = nontf.ids %>%
+  filter(ensembl_transcript_id %in% selected.table.log2.med.ts$ensembl_transcript_id)
+
+write.table(nontf.ids.filtered,
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table_filtered.tsv",
+            quote = F,
+            sep = "\t")
+
+write.table(selected.table.genes.log2.med[rownames(selected.table.genes.log2.med) %in% unique(c(tf.ids.filtered$ensembl_gene_id, nontf.ids.filtered$ensembl_gene_id)), ],
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_final.tsv", 
+            quote = F,
+            sep = "\t",
+            row.names = T)
+
+selected.table.genes.log2.med.ts = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_ts.tsv",
+                                              header = T,
+                                              sep = "\t",
+                                              stringsAsFactors = F)
+
+write.table(selected.table.genes.log2.med.ts[selected.table.genes.log2.med.ts$ensembl_gene_id %in% unique(c(tf.ids.filtered$ensembl_gene_id, nontf.ids.filtered$ensembl_gene_id)), ],
+            file = "data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_ts_final.tsv", 
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+## Prepare the TF family table
+
+Correspond TF gene IDs to gene names and TF families:
+
+```{r, include=T}
+tf.family.table = read.delim("data/results/base_dbd_expression_analysis_table.tsv",
+                             header = T,
+                             sep = "\t",
+                             stringsAsFactors = F) %>%
+  dplyr::select(tf_family, ensembl_gene_id, humantfs_gene_name, ensembl_transcript_id)
+
+write.table(tf.family.table,
+            file = "data/results/tf_family_table.tsv",
+            quote = F,
+            sep = "\t")
+```
+
+## Final stats
+
+Finally, we have the following numbers of genes and isoforms:
+
+```{r, include=T}
+selected.table.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_filtered.tsv",
+                                     header = T,
+                                     sep = "\t",
+                                     stringsAsFactors = F)
+
+selected.table.genes.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_final.tsv",
+                                           header = T,
+                                           sep = "\t",
+                                           stringsAsFactors = F)
+
+cat("Genes, total:", nrow(selected.table.genes.log2.med), "\n")
+cat("Isoforms, total:", nrow(selected.table.log2.med), "\n")
+cat("TFs:", length(unique(tf.ids.filtered$ensembl_gene_id)), "\n")
+cat("TF isoforms:", length(tf.ids.filtered$ensembl_transcript_id), "\n")
+cat("Non-TFs:", length(unique(nontf.ids.filtered$ensembl_gene_id)), "\n")
+cat("Non-TF isoforms:", length(nontf.ids.filtered$ensembl_transcript_id), "\n")
+```
+
+## Check distributions of Tau index
+
+We expect to have a bimodal distribution of Tau index for isoforms and genes.
+
+Let us check it for isoforms first:
+
+```{r, include=T}
+selected.table.vsd.norm.med.ts = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_ts_final.tsv",
+                                            header = T,
+                                            sep = "\t",
+                                            stringsAsFactors = F)
+
+selected.table.vsd.norm.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_filtered.tsv",
+                                         header = T,
+                                         sep = "\t",
+                                         stringsAsFactors = F)
+
+selected.table.vsd.norm.med$max.count = rowMax(as.matrix(selected.table.vsd.norm.med))
+
+tf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table_filtered.tsv",
+                             header = T,
+                             sep = "\t",
+                             stringsAsFactors = F)
+
+nontf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table_filtered.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+
+nonnoise.isoform.ids = rownames(selected.table.vsd.norm.med[selected.table.vsd.norm.med$max.count > 1, ])
+
+#length(nonnoise.isoform.ids[nonnoise.isoform.ids %in% tf.ids.filtered$ensembl_transcript_id])
+
+selected.table.vsd.norm.med.ts[selected.table.vsd.norm.med.ts$ensembl_transcript_id %in% nonnoise.isoform.ids, ] %>%
+  #filter(ensembl_transcript_id %in% tf.ids.filtered$ensembl_transcript_id) %>%
+  filter(ensembl_transcript_id %in% nontf.ids.filtered$ensembl_transcript_id) %>%
+  ggplot(aes(x = tissue_specificity)) +
+    geom_density(fill = "green", alpha = 0.5) +
+    theme_classic()
+```
+
+For genes:
+
+```{r, include=T}
+tf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table_filtered.tsv",
+                             header = T,
+                             sep = "\t",
+                             stringsAsFactors = F)
+
+nontf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table_filtered.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+
+selected.table.vsd.genes.norm.med.ts = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_ts_final.tsv",
+                                                  header = T,
+                                                  sep = "\t",
+                                                  stringsAsFactors = F)
+
+selected.table.vsd.genes.norm.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_final.tsv",
+                                               header = T,
+                                               sep = "\t",
+                                               stringsAsFactors = F)
+
+selected.table.vsd.genes.norm.med$max.count = rowMax(as.matrix(selected.table.vsd.genes.norm.med))
+
+nonnoise.gene.ids = rownames(selected.table.vsd.genes.norm.med[selected.table.vsd.genes.norm.med$max.count > 1, ])
+
+selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id %in% nonnoise.gene.ids, ] %>%
+  #filter(ensembl_gene_id %in% tf.ids.filtered$ensembl_gene_id) %>%
+  #filter(ensembl_gene_id %in% nontf.ids.filtered$ensembl_gene_id) %>%
+  ggplot(aes(x = tissue_specificity)) +
+    geom_density(fill = "green", alpha = 0.5) +
+    theme_classic()
+```
+
+Check the proportion of expressed genes in each tissue:
+
+```{r, include=T}
+tissue.names = names(selected.table.vsd.genes.norm.med)[names(selected.table.vsd.genes.norm.med) != "max.count"]
+expressed.gene.fraction = unlist(lapply(tissue.names,
+                                        function(x) {
+                                          nrow(selected.table.vsd.genes.norm.med[selected.table.vsd.genes.norm.med[[x]] > 1, ])
+                                        }))
+data.frame(tissue.names = tissue.names,
+           expressed.gene.fraction = expressed.gene.fraction) %>%
+  arrange(desc(expressed.gene.fraction))
+
+expressed.isoform.fraction = unlist(lapply(tissue.names,
+                                           function(x) {
+                                             nrow(selected.table.vsd.norm.med[selected.table.vsd.norm.med[[x]] > 1, ])
+                                           }))
+data.frame(tissue.names = tissue.names,
+           expressed.isoform.fraction = expressed.isoform.fraction) %>%
+  arrange(desc(expressed.isoform.fraction))
+```
+
+Calculate gene tissue specificity as a number of tissues where a gene is expressed:
+
+```{r, include=T}
+expressing.tissues.n = apply(selected.table.vsd.genes.norm.med, 1, function(x) {length(x[x > 1])})
+data.frame(ensembl_gene_id = names(expressing.tissues.n),
+           expressing.tissues.n = expressing.tissues.n) %>%
+  ggplot(aes(x = expressing.tissues.n)) +
+    geom_histogram(fill = "green", alpha = 0.5, binwidth = 1) +
+    theme_classic()
+```
+
+```{r}
+data.frame(ensembl_gene_id = names(expressing.tissues.n),
+           expressing.tissues.n = expressing.tissues.n) %>%
+  filter(ensembl_gene_id == "ENSG00000171560")
+```
+
+```{r, include=T}
+data.frame(specific_genes = c("Brain: GFAP",
+             "Brain: STMN2",
+             "Brain: GAP43",
+             "Brain: NEFL",
+             "Testis: OXCT2",
+             "Testis: SYCP1",
+             "Testis: DMRTB1",
+             "Prostate: KLK2",
+             "Prostate: KLK3"),
+           tau_index = c(selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000131095", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000104435", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000172020", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000277586", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000198754", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000198765", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000143006", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000167751", "tissue_specificity"],
+             selected.table.vsd.genes.norm.med.ts[selected.table.vsd.genes.norm.med.ts$ensembl_gene_id == "ENSG00000142515", "tissue_specificity"]))
+```
+
+Check the genes with the top tau values:
+
+```{r, include=T}
+selected.table.vsd.genes.norm.med.ts %>%
+  arrange(desc(tissue_specificity)) %>%
+  head(15)
+```
+
+The top of the most tissue-specific genes are testis-specific.
+
+Check unspecific genes:
+
+```{r, include=T}
+selected.table.vsd.genes.norm.med.ts %>%
+  arrange(tissue_specificity) %>%
+  head(500)
+```

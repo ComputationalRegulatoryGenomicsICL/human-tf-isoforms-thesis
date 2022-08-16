@@ -1,0 +1,325 @@
+---
+title: "Alternative splicing of domains in human transcription factors"
+author: "Slava Sidorov"
+date: "11/11/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "/home/rstudio")
+knitr::opts_chunk$set(echo = TRUE)
+stringsAsFactors = F
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(scales)
+library(kableExtra)
+```
+
+## Separate DBD- isoforms
+
+Separate DBD- isoforms with at least one non-DBD (domain+ isoforms) from DBD- isoforms without any domains (domain- isoforms).
+Additionally, from domain+ isoforms exclude those with non-canonical DBDs.
+
+Process only expressed DBD- isoforms.
+
+```{r, include=T}
+nodbd.isoforms = dbd_yes_no_tx_table %>% 
+  filter(n_canonical == 0) %>%
+  pull(ensembl_transcript_id)
+
+nodbd.isoforms.expressed = selected.table.log2.med %>%
+  tibble::rownames_to_column("ensembl_transcript_id") %>%
+  filter(ensembl_transcript_id %in% nodbd.isoforms) %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., is.expressed = (any(.[, tissue.names] >= 1)))) %>%
+  ungroup() %>%
+  filter(is.expressed)
+
+domain.minus.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  filter(ensembl_transcript_id %in% nodbd.isoforms.expressed$ensembl_transcript_id) %>%
+  filter(is.na(ipr_accession))
+
+domain.minus.isoforms.expression = nodbd.isoforms.expressed %>%
+  filter(ensembl_transcript_id %in% domain.minus.isoforms$ensembl_transcript_id)
+
+noncan.dbd.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  filter(ensembl_transcript_id %in% nodbd.isoforms.expressed$ensembl_transcript_id) %>%
+  left_join(nondbd.annot,
+            by = c("ipr_accession" = "ipr_accession",
+                   "ipr_description" = "ipr_description")) %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, DBD, represents_family,
+                ensembl_transcript_id, ipr_accession, ipr_description, int_start, int_stop,
+                Molecular_function) %>%
+  distinct() %>%
+  filter(stringr::str_detect(Molecular_function, fixed("DBD")))
+
+domain.plus.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  filter(ensembl_transcript_id %in% nodbd.isoforms.expressed$ensembl_transcript_id) %>%
+  filter(!ensembl_transcript_id %in% domain.minus.isoforms$ensembl_transcript_id) %>%
+  filter(!ensembl_transcript_id %in% noncan.dbd.isoforms$ensembl_transcript_id)
+
+domain.plus.isoforms.expression = nodbd.isoforms.expressed %>%
+  filter(ensembl_transcript_id %in% domain.plus.isoforms$ensembl_transcript_id)
+
+nodbd.isoforms.perse = domain.plus.isoforms %>%
+  bind_rows(domain.minus.isoforms)
+```
+
+## Annotate possible DBD- isoform functions
+
+Create a raw table of molecular functions of non-DBDs in DBD- isoforms for further manual filling in:
+
+```{r, include=T}
+write.table(nondbd.annot.summary, 
+            file = "analysis/classify_domains/output/classify_domains/Other_domains_manually_curated_filled_in_dbdminus_raw.tsv", 
+            quote = F, 
+            sep = "\t", 
+            row.names = F)
+```
+
+Upload necessary tables:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl = read.delim("data/results/domain_analysis/tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl.tsv",
+            header = T)
+
+selected.table.log2.med = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_filtered.tsv",
+                                     header = T,
+                                     sep = "\t",
+                                     stringsAsFactors = F)
+
+nondbd.iprs.dbdminus.annotation = read.delim("analysis/classify_domains/output/classify_domains/Other_domains_manually_curated_filled_in_dbdminus_filled.tsv")
+```
+
+Annotate expressed domain+ C2H2 ZF isoforms in terms of their possible functions:
+
+```{r, include=T, fig.height=5}
+domain.plus.isoforms.annotation = domain.plus.isoforms %>%
+  left_join(nondbd.annot,
+            by = c("ipr_accession" = "ipr_accession",
+                   "ipr_description" = "ipr_description")) %>%
+  left_join(nondbd.iprs.dbdminus.annotation,
+            by = c("Molecular_function" = "Molecular_function")) %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, DBD, 
+                ensembl_transcript_id, ipr_accession, ipr_description, int_start, int_stop,
+                Molecular_function, Function_in_DBD_minus) %>%
+  distinct() %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., dbdminus_annotation = paste0(unique(sort(unlist(stringr::str_split(.$Function_in_DBD_minus,
+                                                                                  fixed("; "))))),
+                                            collapse = "; "))) %>%
+  ungroup() %>%
+  mutate(dbdminus_annotation = ifelse(substring(dbdminus_annotation, 1, 2) == "; ",
+                                      substring(dbdminus_annotation, 3),
+                                      dbdminus_annotation)) %>%
+  mutate(dbdminus_annotation = stringr::str_remove(dbdminus_annotation, "; Unclear")) %>%
+  mutate(dbdminus_annotation = stringr::str_remove(dbdminus_annotation, "Unclear; ")) %>%
+  mutate(dbdminus_annotation = stringr::str_remove(dbdminus_annotation, "Unclear")) %>%
+  mutate(dbdminus_annotation = ifelse(dbdminus_annotation == "",
+                                      "Unspecified",
+                                      dbdminus_annotation))
+
+domain.plus.isoforms.annotation.summary = data.frame(dbdminus_annotation = unlist(stringr::str_split(domain.plus.isoforms.annotation %>%
+                                                                                                       filter(DBD == "C2H2 ZF") %>%
+                                                                                                       dplyr::select(ensembl_transcript_id,
+                                                                                                                     dbdminus_annotation) %>%
+                                                                                                       distinct() %>%
+                                                                                                       pull(dbdminus_annotation),
+                                                                                                     fixed("; ")))) %>%
+  count(dbdminus_annotation)
+
+domain.plus.isoforms.number = domain.plus.isoforms %>%
+  filter(DBD == "C2H2 ZF") %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+domain.plus.isoforms.annotation.summary %>%
+  mutate(frequency = n / domain.plus.isoforms.number) %>%
+  arrange(desc(n)) %>%
+  head(10) %>%
+  mutate(dbdminus_annotation = factor(dbdminus_annotation, levels = dbdminus_annotation)) %>%
+  ggplot(aes(x = dbdminus_annotation, y = frequency)) +
+    geom_col(fill = "orange") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+As expected according to the highest frequency of the KRAB transcription repression domain, the most frequent function of C2H2 ZF domain+ isoforms is corepressor sequestration. 
+
+Check function frequencies for non-C2H2 ZF domain+ isoforms:
+
+```{r, include=T}
+domain.plus.isoforms.annotation.summary = data.frame(dbdminus_annotation = unlist(stringr::str_split(domain.plus.isoforms.annotation %>%
+                                                                                                       filter(DBD != "C2H2 ZF") %>%
+                                                                                                       dplyr::select(ensembl_transcript_id,
+                                                                                                                     dbdminus_annotation) %>%
+                                                                                                       distinct() %>%
+                                                                                                       pull(dbdminus_annotation),
+                                                                                                     fixed("; ")))) %>%
+  count(dbdminus_annotation)
+
+domain.plus.isoforms.number = domain.plus.isoforms %>%
+  filter(DBD != "C2H2 ZF") %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+domain.plus.isoforms.annotation.summary %>%
+  mutate(frequency = n / domain.plus.isoforms.number) %>%
+  arrange(desc(n)) %>%
+  head(10) %>%
+  mutate(dbdminus_annotation = factor(dbdminus_annotation, levels = dbdminus_annotation)) %>%
+  ggplot(aes(x = dbdminus_annotation, y = frequency)) +
+    geom_col(fill = "orange") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Now the most frequent function is "Self-sequestration". Check in which TF families it happens:
+
+```{r, include=T}
+domain.plus.isoforms.annotation.summary.dbd = data.frame(DBD = domain.plus.isoforms.annotation %>%
+                                                                 filter(DBD != "C2H2 ZF") %>%
+                                                                 filter(stringr::str_detect(dbdminus_annotation, fixed("Self-sequestration")))  %>%
+                                                                 dplyr::select(DBD, ensembl_transcript_id) %>%
+                                                                 distinct() %>%
+                                                                 pull(DBD)) %>%
+  count(DBD)
+
+domain.plus.isoforms.annotation.summary.dbd %>%
+  arrange(desc(n))
+```
+
+Summarise TFs that sequester themselves or their partner TFs with DBD- isoforms:
+
+```{r, include=T}
+dimer.tfs.summary = domain.plus.isoforms.annotation %>%
+  filter(DBD != "C2H2 ZF") %>%
+  filter(stringr::str_detect(Function_in_DBD_minus, fixed("Self-sequestration")) | 
+           stringr::str_detect(Function_in_DBD_minus, fixed("Partner TF sequestration")))  %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, DBD) %>%
+  distinct() %>%
+  arrange(DBD)
+
+dimer.tfs.summary
+```
+
+It seems that too few TFs use their DBD- isoforms for self- or partner TF sequestration. Hence, let's check how many TFs from dimerising families listed above have annotated dimerization domains in their expressed isoforms. Such TFs could produce DBD- isoforms for sequestration, and we know the number of TFs in each of these families that actually do this.
+
+```{r, include=T}
+tf.families = dimer.tfs.summary %>%
+  pull(DBD) %>%
+  unique()
+
+base.sequestr.table = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  left_join(nondbd.annot,
+            by = c("ipr_accession" = "ipr_accession",
+                   "ipr_description" = "ipr_description")) %>%
+  left_join(nondbd.iprs.dbdminus.annotation,
+            by = c("Molecular_function" = "Molecular_function")) %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, DBD, 
+                ensembl_transcript_id, ipr_accession, ipr_description, int_start, int_stop,
+                Molecular_function, Function_in_DBD_minus) %>%
+  distinct() %>%
+  filter(DBD %in% tf.families) %>%
+  arrange(DBD)
+
+dimer.annotated.table = base.sequestr.table %>%
+  filter(stringr::str_detect(Function_in_DBD_minus, fixed("Self-sequestration")) | 
+           stringr::str_detect(Function_in_DBD_minus, fixed("Partner TF sequestration")))
+
+all.isoforms.expressed = selected.table.log2.med %>%
+  tibble::rownames_to_column("ensembl_transcript_id") %>%
+  group_by(ensembl_transcript_id) %>%
+  do(mutate(., is.expressed = (any(.[, tissue.names] >= 1)))) %>%
+  ungroup() %>%
+  filter(is.expressed)
+
+expr.dimer.table = dimer.annotated.table %>%
+  filter(ensembl_transcript_id %in% all.isoforms.expressed$ensembl_transcript_id)
+
+with.nodbd.expr.dimer.table = expr.dimer.table %>%
+  filter(ensembl_transcript_id %in% nodbd.isoforms.expressed$ensembl_transcript_id)
+
+data.frame(tf.families = tf.families,
+           all.tfs = base.sequestr.table %>%
+             dplyr::select(ensembl_gene_id, DBD) %>%
+             distinct() %>% 
+             count(DBD) %>%
+             pull(n),
+           dimer.annot = dimer.annotated.table %>%
+             dplyr::select(ensembl_gene_id, DBD) %>%
+             distinct() %>% 
+             count(DBD) %>%
+             pull(n),
+           expr.dimer.annot = expr.dimer.table %>%
+             dplyr::select(ensembl_gene_id, DBD) %>%
+             distinct() %>% 
+             count(DBD) %>%
+             pull(n),
+           with.nodbd.expr.dimer.annot = with.nodbd.expr.dimer.table %>%
+             dplyr::select(ensembl_gene_id, DBD) %>%
+             distinct() %>% 
+             count(DBD) %>%
+             pull(n)) %>%
+  arrange(desc(all.tfs))
+```
+
+Dimerisation domains in each family:
+
+```{r, include=T}
+dimer.annotated.table %>%
+  dplyr::select(DBD, humantfs_gene_name, ipr_accession, ipr_description, Function_in_DBD_minus) %>%
+  distinct() %>%
+  arrange(DBD, humantfs_gene_name) #%>%
+  # filter(stringr::str_detect(Function_in_DBD_minus, fixed("Self-sequestration")) |
+  #        stringr::str_detect(Function_in_DBD_minus, fixed("Partner TF sequestration")))
+```
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  #filter(DBD %in% tf.families) %>%
+  dplyr::select(DBD, humantfs_gene_name, ipr_accession, ipr_description) %>%
+  distinct() %>%
+  arrange(DBD, humantfs_gene_name, ipr_accession) %>%
+  filter(!is.na(ipr_accession)) %>%
+  filter(DBD == "T-box")
+  #filter(humantfs_gene_name == "NFIX")
+```
+
+1) TF families where the characteristic dimerization domain is not annotated:
+
+a) bHLH: We count IPR011598 (Myc-type, basic helix-loop-helix (bHLH) domain) as basic+HLH, so no DBD- isoforms can have a separate HLH domain in our annotation. Instead of the HLH domain, we have other dimerisation domains annotated in some TFs of this family: Orange domain (IPR003650), NCOA-type interlocking domain (IPR014920) and even, in one TF, an LZ domain (IPR003327). However, out of 15 bHLH TFs with these non-HLH dimerisation domains, only one TF expressed a dimerising DBD- isoform.
+
+b) bZIP: We count IPR004827 (Basic-leucine zipper domain) as basic+LZ, so no DBD- isoforms can have a separate LZ domain in our annotation. Only two bZIP factors are expressed in our dataset.
+
+2) Unclear families:
+
+a) GATA: Not sure if all GATA TFs dimerise and which domains they use for dimerisation; these domains also could be a part of a DBD.
+
+b) Homeodomain factors can use different parts of the protein for dimerisation, including the homeodomain itself. So it is hard to say how many TFs from the homeodomain family should have separately annotated dimerisation domains (and which). Also, those homeodmain TFs that dimerise using the DBD, by definition would not have any dimerising DBD- isoforms. However, from the 33 homeodomain TFs that do have some dimerisation domains and are expressed, only one produces a DBD- isoform with a dimerisation domain.
+
+c) Myb/SANT: dimerisation can occur through the DBD.
+
+d) SAND: 3 out of 7 SAND TFs are expressed in adult human tissues and do have a dimerisation domain, although it is not clear if it is the main, characteristic, dimerisation domain for these proteins. Anyway, out of these 3 TF, only 1 expresses a DBD- isoform with a dimerisation domain.
+
+e) HSF: Unclear what the dimerisation domain there is, and if all HSFs should dimerise.
+
+f) Ndt80/PhoG - Too few TFs there are, not interesting.
+
+g) "HMG/Sox; SAND" - Too few TFs there are, not interesting.
+
+3) TF families where the characteristic dimerization domain is annotated:
+
+a) IRF (IPR019471: Interferon regulatory factor-3): Only 2 IRF TFs out of 7 with the dimerisation domain have a DBD- isoform with that domain.
+
+b) STAT (IPR013799: STAT transcription factor, protein interaction): Only 1 STAT TF out of 7 with the dimerisation domain have a DBD- isoform with that domain.
+
+c) SMAD (IPR001132: SMAD domain, Dwarfin-type; IPR019548: CTF transcription factor/nuclear factor 1, N-terminal; the second one is annotated in the NF-I subfamily): Only 2 SMAD TFs out of 9 with the dimerisation domain have a DBD- isoform with that domain.
+
+Although we lose the majority of TFs in about half of the families due to dimerisation domains not being annotated separately, we still observe that in all the families those TFs that are annotated with dimerisation domains almost do not use DBD- isoforms for sequestration. For example, among 33 Homeodomain TFs that are expressed in adult human tissues and have a dimerisation domain annotated, only one expresses a DBD- isoform with such a domain. On the other hand, we need to check if the classical HLH, leucine zipper and other dimerisation domains characteristic of particular families could be annotated, as TFs may not use some non-canonical dimerisation domains in their DBD- isoforms but instead retain the canonical ones that are not currently annotated.

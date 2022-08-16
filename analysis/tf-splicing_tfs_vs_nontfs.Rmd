@@ -1,0 +1,569 @@
+---
+title: "Expression of DBD+/- TF isoforms"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+   html_document:
+     code_folding: hide
+     collapsed: no
+     fig_align: center
+     fig_caption: yes
+     highlight: haddock
+     keep_md: yes
+     number_sections: yes
+     smooth_scroll: no
+     toc: yes
+     toc_depth: 3
+     toc_float: yes
+---
+
+```{r setup, include=T}
+require("knitr")
+opts_knit$set(root.dir = "/home/rstudio")
+knitr::opts_chunk$set(echo = TRUE)
+stringsAsFactors = F
+
+library(tidyverse)
+library(kableExtra)
+library(biomaRt)
+library(dplyr) 
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(tictoc)
+```
+
+## Load and prepare the data about TF isoforms
+
+Read in the base table (it contains filtered TF isoforms) and exclude the 7 TFs without DBD+ isoforms from it:
+
+```{r, include=T}
+base.table = read.delim("data/results/base_dbd_expression_analysis_table.tsv",
+                        header = T,
+                        sep = "\t",
+                        stringsAsFactors = F)
+
+# # AHRR, HOXA1, SETBP1, LCORL, ZNF609, RFX8, ZNF81
+# tfs.to.exclude = c("ENSG00000063438", # AHRR
+#                    "ENSG00000105991", # HOXA1
+#                    "ENSG00000152217", # SETBP1
+#                    "ENSG00000178177", # LCORL
+#                    "ENSG00000180357", # ZNF609
+#                    "ENSG00000196460", # RFX8
+#                    "ENSG00000197779") # ZNF81
+# 
+# base.table = base.table %>%
+#   filter(!ensembl_gene_id %in% tfs.to.exclude)
+  
+head(base.table)
+```
+
+! Need to unify the set of TFs across all parts of my analysis. For example, here I analyse 1,512 TFs (including the 7 ones that lost DBD+ isoforms due to Ensembl annotation quality filtering), but in the switch part I have 1,488 TFs. So, I need to find the difference.
+
+Create a table with transcript properties:
+
+```{r, include=T}
+ensembl = useEnsembl(biomart = "ensembl",
+                     dataset = "hsapiens_gene_ensembl",
+                     version = "99")
+
+ensg_enst_attr = getBM(attributes = c("ensembl_gene_id",
+                                      "start_position", # gene start position
+                                      "end_position", # gene end position
+                                      "ensembl_transcript_id",
+                                      "ensembl_exon_id",
+                                      "transcript_length",
+                                      "transcript_tsl",
+                                      "transcript_mane_select"),
+                       filters = "transcript_biotype",
+                       values = "protein_coding",
+                       mart = ensembl) %>%
+  mutate(gene_length = end_position - start_position + 1) %>%
+  arrange(ensembl_gene_id, ensembl_transcript_id, ensembl_exon_id)
+
+# Write down the whole table (for not to have to retrieve the whole annotation from Ensembl on every run)
+write.table(ensg_enst_attr,
+            file = "data/ensembl99/ensembl99_whole.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+# Write down a filtered table (for Koustav)
+write.table(ensg_enst_attr %>%
+              group_by(ensembl_gene_id, ensembl_transcript_id) %>%
+              mutate(transcript_tsl_code = unlist(stringr::str_split(transcript_tsl, fixed(" ")))[1]) %>%
+              ungroup() %>%
+              filter((transcript_tsl_code == "tsl1") | 
+                     (transcript_tsl_code == "tsl2") | 
+                     (transcript_tsl_code == "tslNA") | 
+                     (transcript_mane_select != "")),
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+Join the base table with the table of transcript properties from Ensembl:
+
+```{r, include=T}
+tf.isoform.table = base.table %>%
+  left_join(ensg_enst_attr %>%
+              dplyr::select(-transcript_tsl,
+                            -transcript_mane_select), 
+            by = c("ensembl_gene_id", "ensembl_transcript_id")) 
+
+head(tf.isoform.table)
+
+# Write down the TF isoform table without exon IDs for tissue-speicificity analysis
+write.table(tf.isoform.table %>%
+              dplyr::select(ensembl_gene_id, 
+                            ensembl_transcript_id) %>%
+              distinct(),
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+# Write down the TF isoform table with exon IDs for Koustav
+write.table(tf.isoform.table %>%
+              dplyr::select(ensembl_gene_id, 
+                            ensembl_transcript_id,
+                            ensembl_exon_id) %>%
+              distinct(),
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table_with_exons.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+Check if any isoforms do not have defined attributes:
+
+```{r, include=T}
+tf.isoform.table %>%
+  filter(is.na(ensembl_exon_id) | is.na(transcript_length))
+```
+
+All isoforms have at least one exon and length. In total, we have `r tf.isoform.table %>% pull(ensembl_gene_id) %>% unique() %>% length()` TFs and `r tf.isoform.table %>% pull(ensembl_transcript_id) %>% unique() %>% length()` TF isoforms.
+
+Define non-TF isoforms according to the same filtering criteria (TSL 1, 2 or NA, and MANE tag present):
+
+```{r, include=T}
+nontf.isoform.table = ensg_enst_attr %>%
+  filter(!ensembl_gene_id %in% tf.isoform.table$ensembl_gene_id) %>%
+  group_by(ensembl_gene_id, ensembl_transcript_id) %>%
+  mutate(transcript_tsl_code = unlist(stringr::str_split(transcript_tsl, fixed(" ")))[1]) %>%
+  ungroup() %>%
+  filter((transcript_tsl_code == "tsl1") | 
+         (transcript_tsl_code == "tsl2") | 
+         (transcript_tsl_code == "tslNA") | 
+         (transcript_mane_select != ""))
+
+head(nontf.isoform.table)
+
+# Write down the TF isoform table without exon IDs for tissue-speicificity analysis
+write.table(nontf.isoform.table %>%
+              dplyr::select(ensembl_gene_id, 
+                            ensembl_transcript_id) %>%
+              distinct(),
+            file = "data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+In total, we have `r nontf.isoform.table %>% pull(ensembl_gene_id) %>% unique() %>% length()` non-TF coding genes and `r nontf.isoform.table %>% pull(ensembl_transcript_id) %>% unique() %>% length()` non-TF isoforms.
+
+## Compare production of alternative isoforms in TF and non-TF genes
+
+Compare the proportions of TFs and non-TFs that produce more than one isoform:
+
+```{r, include=T}
+as.tfs.n = tf.isoform.table %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id) %>%
+  distinct() %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., multiple.isoforms = (nrow(.) > 1))) %>%
+  ungroup() %>%
+  arrange(ensembl_gene_id) %>%
+  filter(multiple.isoforms) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+
+all.tfs.n = tf.isoform.table %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+
+as.nontfs.n = nontf.isoform.table %>%
+  dplyr::select(ensembl_gene_id, ensembl_transcript_id) %>%
+  distinct() %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., multiple.isoforms = (nrow(.) > 1))) %>%
+  ungroup() %>%
+  arrange(ensembl_gene_id) %>%
+  filter(multiple.isoforms) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+
+all.nontfs.n = nontf.isoform.table %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length()
+
+# Two-sided two-sample test for equality of proportions of alternatively spliced TF and non-TF genes with continuity correction 
+prop.test(x = c(as.tfs.n, as.nontfs.n),
+          n = c(all.tfs.n, all.nontfs.n),
+          alternative = "two.sided",
+          conf.level = 0.95)
+
+as.genes.n = as.tfs.n + as.nontfs.n
+
+all.genes.n = all.tfs.n + all.nontfs.n
+
+# Two-sided two-sample test for equality of proportions of alternatively spliced TFs and all genes with continuity correction 
+prop.test(x = c(as.tfs.n, as.genes.n),
+          n = c(all.tfs.n, all.genes.n),
+          alternative = "two.sided",
+          conf.level = 0.95)
+```
+
+Use the two-sided Mann-Whitney U test to compare distributions of features between TFs and non-TF genes.
+
+We have `r tf.isoform.table %>% pull(ensembl_transcript_id) %>% unique() %>% length()` protein-coding isoforms from `r tf.isoform.table %>% pull(ensembl_gene_id) %>% unique() %>% length()` TFs and `r nontf.isoform.table %>% pull(ensembl_transcript_id) %>% unique() %>% length()` protein-coding isoforms from `r nontf.isoform.table %>% pull(ensembl_gene_id) %>% unique() %>% length()` non-TF genes, and we use them in the tests below.
+
+First, compare the lengths of TF and non-TF genes. Generate vectors of gene lengths:
+
+```{r, include=T}
+tf.gene.lengths = tf.isoform.table %>%
+  dplyr::select(ensembl_gene_id, gene_length) %>%
+  distinct() %>%
+  pull(gene_length)
+
+nontf.gene.lengths = nontf.isoform.table %>%
+  dplyr::select(ensembl_gene_id, gene_length) %>%
+  distinct() %>%
+  pull(gene_length)
+```
+
+Let us plot these distributions, log10-scaled, with median gene lengths marked by vertical lines. Hereafter, TF features are in red, while non-TF features are in blue:
+
+```{r, include=T}
+library(scales)
+tf.gene.length.median = median(tf.gene.lengths)
+
+nontf.gene.length.median = median(nontf.gene.lengths)
+
+p = ggplot(data = data.frame(l = tf.gene.lengths), aes(x = l)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  geom_density(data = data.frame(l = nontf.gene.lengths), aes(x = l), fill = "blue", alpha = 0.5) +
+  geom_vline(xintercept = tf.gene.length.median,
+             color = "red") + 
+  geom_vline(xintercept = nontf.gene.length.median,
+             color = "blue") + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  theme_classic() +
+  annotation_logticks(sides = "b") + 
+  xlab("Gene length (bp)") +
+  ylab("Frequency")
+
+ggsave(filename = "data/results/tfs_vs_nontfs_gene_length_overall_distributions.pdf",
+       plot = p,
+       width = 4,
+       height = 3)
+```
+
+Hence, TFs and non-TFs have almost indistinguishable median gene lengths.
+
+Next, compare the number of exons in TF and non-TF genes. Generate vectors of the number of exons:
+
+```{r, include=T}
+tf.gene.exon_numbers = tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_exon_number) %>% 
+  distinct() %>%  
+  pull(gene_exon_number)
+
+nontf.gene.exon_numbers = nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_exon_number) %>% 
+  distinct() %>% 
+  pull(gene_exon_number)
+```
+
+Let us plot these distributions, log10-scaled, with median numbers of exons marked by vertical lines:
+
+```{r, include=T}
+tf.exon.number.median = median(tf.gene.exon_numbers)
+
+nontf.exon.number.median = median(nontf.gene.exon_numbers)
+
+p = ggplot(data = data.frame(n = tf.gene.exon_numbers), aes(x = n)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  geom_density(data = data.frame(n = nontf.gene.exon_numbers), aes(x = n), fill = "blue", alpha = 0.5) +
+  geom_vline(xintercept = tf.exon.number.median,
+             color = "red") + 
+  geom_vline(xintercept = nontf.exon.number.median,
+             color = "blue") + 
+  scale_x_continuous(trans = "log10") +  
+  theme_classic() +
+  annotation_logticks(sides = "b") + 
+  xlab("Number of exons") +
+  ylab("Frequency")
+
+ggsave(filename = "data/results/tfs_vs_nontfs_exon_numbers_overall_distributions.pdf",
+       plot = p,
+       width = 4,
+       height = 3)
+```
+
+Hence, single-exon genes are more frequent among non-TFs. However, genes with 2 to 10 exons are more frequent in TFs, while genes with more than 10 exons are more frequent in non-TFs. Importantly, the median number of exons is lower for TFs.
+
+Because TFs and non-TFs have the same median gene length and TFs have a lower median number of exons, we expect that the median number of isoforms produced by TFs is lower than the median number of isoforms produced by non-TFs. Let us compare the numbers of isoforms produced by TFs and non-TFs.
+
+Prepare vectors of the number of isoforms:
+
+```{r, include=T}
+tf.gene.isoform_numbers = tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_isoform_number) %>% 
+  distinct() %>% 
+  pull(gene_isoform_number)
+
+nontf.gene.isoform_numbers = nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_isoform_number) %>% 
+  distinct() %>% 
+  pull(gene_isoform_number)
+```
+
+Let us plot these distributions, log10-scaled, with median numbers of isoforms marked by solid vertical lines and mean numbers marked by dashed lines:
+
+```{r, include=T}
+tf.gene.isoform.num.median = median(tf.gene.isoform_numbers)
+
+nontf.gene.isoform.num.median = median(nontf.gene.isoform_numbers)
+
+tf.gene.isoform.num.mean = mean(tf.gene.isoform_numbers)
+
+nontf.gene.isoform.num.mean = mean(nontf.gene.isoform_numbers)
+
+tf.gene.isoform_numbers.df = tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_isoform_number) %>% 
+  distinct() %>% 
+  arrange(gene_isoform_number) %>%
+  group_by(gene_isoform_number) %>%
+  mutate(n_count = length(unique(ensembl_gene_id))) %>%
+  ungroup() %>%
+  dplyr::select(gene_isoform_number, n_count) %>%
+  distinct() %>%
+  mutate(n_freq = n_count / sum(n_count))
+
+nontf.gene.isoform_numbers.df = nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_isoform_number) %>% 
+  distinct() %>% 
+  arrange(gene_isoform_number) %>%
+  group_by(gene_isoform_number) %>%
+  mutate(n_count = length(unique(ensembl_gene_id))) %>%
+  ungroup() %>%
+  dplyr::select(gene_isoform_number, n_count) %>%
+  distinct() %>%
+  mutate(n_freq = n_count / sum(n_count))
+
+p = ggplot(data = tf.gene.isoform_numbers.df) + 
+  geom_col(aes(x = gene_isoform_number, 
+               y = n_freq), 
+           fill = "red", alpha = 0.5) +
+  geom_col(data = nontf.gene.isoform_numbers.df,
+           aes(x = gene_isoform_number,
+               y = n_freq), 
+           fill = "blue", alpha = 0.5) +
+  geom_vline(xintercept = tf.gene.isoform.num.median,
+             color = "red") + 
+  geom_vline(xintercept = nontf.gene.isoform.num.median,
+             color = "blue") +  
+  geom_vline(xintercept = tf.gene.isoform.num.mean,
+             color = "red",
+             linetype = "dashed") + 
+  geom_vline(xintercept = nontf.gene.isoform.num.mean,
+             color = "blue",
+             linetype = "dashed") + 
+  scale_x_continuous(trans = "log10") +
+  theme_classic() +
+  annotation_logticks(sides = "b") + 
+  xlab("Number of isoforms") +
+  ylab("Frequency")
+
+ggsave(filename = "data/results/tfs_vs_nontfs_isoform_numbers_overall_distributions.pdf",
+       plot = p,
+       width = 4,
+       height = 3)
+```
+
+Hence, the median number of isoforms produced by TFs is exactly the same as the median number for non-TFs (it equals 2), and consequently, the two distributions are not shifted relative to each other. However, from the distributions we can see that non-TFs produce just one isoform more frequntly than TFs and 5 isoforms or more are more characteristic for TFs. Consequently, low numbers of isoforms are more frequently produced by non-TFs while high numbers of isoforms are more frequently produced by TFs. This is reflected by the fact that the _mean_ number of isoforms is greater for TFs. Consequently, in this sense, TFs indeed produce more isoforms than non-TFs, and our results confirm previously published observations.
+
+Next, let us check if the production of a greater number of isoforms by TFs depends on the gene length or the number of exons.
+
+Calculate gene length deciles and plot the mean number of isoforms for TFs and non-TFs in each decile:
+
+```{r, include=T}
+quantile_num = 10
+
+tf.gl.quantilie.table = tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_length, gene_isoform_number) %>%
+  distinct() %>%
+  mutate(gene_length_q = dplyr::ntile(gene_length, quantile_num)) %>%
+  group_by(gene_length_q) %>%
+  mutate(mean_num_per_q = mean(gene_isoform_number)) %>%
+  ungroup() %>%
+  dplyr::select(gene_length_q, mean_num_per_q) %>%
+  distinct() %>%
+  mutate(gene_type = "tf")
+
+nontf.gl.quantilie.table = nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_length, gene_isoform_number) %>%
+  distinct() %>%
+  mutate(gene_length_q = dplyr::ntile(gene_length, quantile_num)) %>%
+  group_by(gene_length_q) %>%
+  mutate(mean_num_per_q = mean(gene_isoform_number)) %>%
+  ungroup() %>%
+  dplyr::select(gene_length_q, mean_num_per_q) %>%
+  distinct() %>%
+  mutate(gene_type = "nontf")
+
+gl.quantile.table = tf.gl.quantilie.table %>%
+  bind_rows(nontf.gl.quantilie.table) %>%
+  mutate(gene_type = factor(gene_type, levels = c("tf", "nontf")))
+
+p = gl.quantile.table %>%
+  ggplot(aes(x = gene_length_q,
+             y = mean_num_per_q,
+             group = gene_type,
+             colour = gene_type)) +
+    geom_line() + 
+    scale_x_continuous(limits = c(1, quantile_num), breaks = scales::pretty_breaks(quantile_num)) +
+    theme_classic()
+
+ggsave(filename = "data/results/tfs_vs_nontfs_isoform_numbers_by_gene_length.pdf",
+       plot = p,
+       width = 4,
+       height = 3)
+```
+
+Hence, from decile 3 upwards TFs produce on average more alternative isoforms than non-TFs, and decile 2 (consisting of very short genes) is the only one where non-TFs produce on average more alternative isoforms than TFs. Additionally, the mean number of alternative isoforms grows faster in TFs than in non-TFs with the increase of the gene length. Finally, the upward trend in the mean number of alternative isoforms for both TFs and non-TFs underscores the importance of taking the gene length into account when studying alternative isoforms.
+
+Compare the mean numbers of alternative isoforms per gene using exact numbers of exons:
+
+```{r, include=T}
+tf.ne.exact.table = tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_exon_number, gene_isoform_number) %>%
+  distinct() %>%
+  group_by(gene_exon_number) %>%
+  mutate(mean_isof_num = mean(gene_isoform_number)) %>%
+  ungroup() %>%
+  dplyr::select(gene_exon_number, mean_isof_num) %>%
+  distinct() %>%
+  mutate(gene_type = "tf")
+
+nontf.ne.exact.table = nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_isoform_number = length(unique(ensembl_transcript_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, gene_exon_number, gene_isoform_number) %>%
+  distinct() %>%
+  group_by(gene_exon_number) %>%
+  mutate(mean_isof_num = mean(gene_isoform_number)) %>%
+  ungroup() %>%
+  dplyr::select(gene_exon_number, mean_isof_num) %>%
+  distinct() %>%
+  mutate(gene_type = "nontf")
+
+cat("N of TFs with >100 exons: ", tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  filter(gene_exon_number > 100) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length(), "\n")
+
+cat("N of non-TFs with >100 exons: ", nontf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  filter(gene_exon_number > 100) %>%
+  pull(ensembl_gene_id) %>%
+  unique() %>%
+  length(), "\n")
+
+max_exon_num = 100
+
+ne.exact.table = tf.ne.exact.table %>%
+  bind_rows(nontf.ne.exact.table) %>%
+  mutate(gene_type = factor(gene_type, levels = c("tf", "nontf")))
+
+p = ne.exact.table %>%
+  ggplot(aes(x = gene_exon_number,
+             y = mean_isof_num,
+             group = gene_type,
+             colour = gene_type)) +
+    geom_line() + 
+    geom_smooth(se = F) +
+    scale_x_continuous(limits = c(1, max_exon_num), breaks = scales::pretty_breaks(max_exon_num / 10 + 1)) +
+    theme_classic()
+
+ggsave(filename = "data/results/tfs_vs_nontfs_isoform_numbers_by_number_of_exons_limit_100.pdf",
+       plot = p,
+       width = 4,
+       height = 3)
+```
+
+Hence, for the vast majority of exon counts shared between TFs and non-TFs, TFs produce on average more alternative isoforms than non-TFs. Across the shared exon counts, the mean number of alternative isoforms produced by both TFs and non-TFs grows with the increase of the exon count, which underscores the importance of a correction for the number of exons when counting alternative isoforms. Additionally, across the shared exon counts, the mean number of alternative TF isoforms grows much faster with the increase of the exon count, than the mean number of alternative non-TF isoforms.
+
+We limited the number of exons by 100, as only 13 genes (all of which are non-TFs) have more exons than that. We could limit the number of exons by the maximum shared exon count, but we also wanted to show the longer trend for non-TFs. Interestingly, after approximately 50 exons, the smoothed mean number of isoforms produced by non-TFs ceases to grow and even decreases. This means that non-TFs with very big numbers of exons "need" this many these exons not to produce a huge number of alternative isoforms, but for something else. Regarding TFs, the "outlier" point that denotes >20 alternative isoforms for ~70 exons is produced by a single TF:
+
+```{r, include=T}
+tf.isoform.table %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(gene_exon_number = length(unique(ensembl_exon_id))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id, humantfs_gene_name, tf_family, gene_exon_number) %>%
+  distinct() %>%
+  arrange(desc(gene_exon_number)) %>%
+  head(1)
+```
+
+([Sepp et al., 2011](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0022138#pone-0022138-g003)) showed that TCF4 coexpresses many different isoforms across many adult human tissues and that some of its isoforms are expressed more broadly then others (see Supplementary Table 1 for more details).
+
+Although TCF4 is a clear outlier, it is worth noting that _any_ non-TF with a comparable number of exons produces ~3 to 8 times fewer alternative isoforms than this TF.

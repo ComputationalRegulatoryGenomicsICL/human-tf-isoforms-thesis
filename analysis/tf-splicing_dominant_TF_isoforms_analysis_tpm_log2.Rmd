@@ -1,0 +1,1565 @@
+---
+title: "Analysis of dominant TF isoforms"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+   html_document:
+     code_folding: hide
+     collapsed: no
+     fig_align: center
+     fig_caption: yes
+     highlight: haddock
+     keep_md: yes
+     number_sections: yes
+     smooth_scroll: no
+     toc: yes
+     toc_depth: 3
+     toc_float: yes
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "/home/rstudio")
+knitr::opts_chunk$set(echo = TRUE)
+stringsAsFactors = F
+
+# Install the unixtools package with
+# install.packages("unixtools",,"http://rforge.net/",type="source")
+library(unixtools)
+set.tempdir("/home/rstudio/r_temp_dir")
+
+library(dplyr) 
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(magrittr)
+library(tictoc)
+library(kableExtra)
+library(biomaRt) 
+library(cluster)
+library(fpc)
+library(gridExtra)
+```
+
+## Upload the data
+
+```{r, include=T}
+tf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_tfs_ID_table_filtered.tsv",
+                             header = T,
+                             sep = "\t",
+                             stringsAsFactors = F)
+
+nontf.ids.filtered = read.delim("data/ensembl99/ensembl99_tsl1_tsl2_tslNA_mane_nontfs_ID_table_filtered.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+
+all.ids.filtered = rbind(tf.ids.filtered, nontf.ids.filtered)
+
+isoform.expression = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_log2_med_filtered.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+```
+
+Hereafter, "dominant isoform" means "major isoform" of a TF. I define the major isoform of a TF in a tissue as the highest expressed isoform of that TF in that tissue.
+
+## Find dominant isoform for each gene in each tissue
+
+```{r, include=T}
+tic("Find dominant isoforms, per TF per tissue")
+
+gene.ids = unique(all.ids.filtered$ensembl_gene_id)
+
+tissue.names = names(isoform.expression)
+
+dominant.isoforms = data.frame(ensembl_gene_id = "")
+
+for (tissue.name in tissue.names) {
+  dominant.isoforms[[tissue.name]] = ""
+}
+
+for (gene.id in gene.ids) {
+  isoform.list = all.ids.filtered %>%
+    filter(ensembl_gene_id == gene.id) %>%
+    pull(ensembl_transcript_id)
+  
+  gene.isoforms.df = isoform.expression[rownames(isoform.expression) %in% isoform.list, ]
+  
+  dominant.isoforms.i = as.data.frame(cbind(c(gene.id), t(rownames(gene.isoforms.df)[apply(gene.isoforms.df, 2, which.max)])))
+  
+  names(dominant.isoforms.i) = c("ensembl_gene_id", tissue.names)
+  
+  dominant.isoforms = dominant.isoforms %>%
+    bind_rows(dominant.isoforms.i)
+}
+
+dominant.isoforms = dominant.isoforms %>%
+  filter(!row_number() %in% c(1))
+
+write.table(dominant.isoforms,
+            file = "data/results/gtex8_processed/dominant_isoforms_all.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+toc()
+# ~3 min
+```
+
+Select TFs and non-TFs and for each of the two groups calculate the proportion of genes that change their dominant isoform across tissues:
+
+```{r, include=T}
+dominant.isoforms = read.delim("data/results/gtex8_processed/dominant_isoforms_all.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+
+dominant.isoforms.tfs = dominant.isoforms %>%
+  filter(ensembl_gene_id %in% tf.ids.filtered$ensembl_gene_id)
+
+dominant.isoforms.nontfs = dominant.isoforms %>%
+  filter(ensembl_gene_id %in% nontf.ids.filtered$ensembl_gene_id)
+
+dominant.isoforms.tfs = dominant.isoforms.tfs %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., dominant.isoforms.n = apply(., 1, function(x) {length(unique(x)) - 1}))) %>% # -1 accounts for gene ID
+  ungroup()
+
+dominant.isoforms.nontfs = dominant.isoforms.nontfs %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., dominant.isoforms.n = apply(., 1, function(x) {length(unique(x)) - 1}))) %>% # -1 accounts for gene ID
+  ungroup()
+
+tfs.n = nrow(dominant.isoforms.tfs)
+
+dominant.isoforms.tfs = dominant.isoforms.tfs %>%
+  group_by(dominant.isoforms.n) %>%
+  mutate(dominant.isoforms.n.freq = length(ensembl_gene_id) / tfs.n) %>%
+  ungroup()
+
+nontfs.n = nrow(dominant.isoforms.nontfs)
+
+dominant.isoforms.nontfs = dominant.isoforms.nontfs %>%
+  group_by(dominant.isoforms.n) %>%
+  mutate(dominant.isoforms.n.freq = length(ensembl_gene_id) / nontfs.n) %>%
+  ungroup()
+
+dominant.isoforms.tfs.freqs = dominant.isoforms.tfs %>% 
+  dplyr::select(dominant.isoforms.n, dominant.isoforms.n.freq) %>% 
+  distinct() %>% 
+  arrange(dominant.isoforms.n)
+
+dominant.isoforms.nontfs.freqs = dominant.isoforms.nontfs %>% 
+  dplyr::select(dominant.isoforms.n, dominant.isoforms.n.freq) %>% 
+  distinct() %>% 
+  arrange(dominant.isoforms.n)
+
+data.frame(Dominant.isoforms.number = c("1", "2", "3", ">3", "1", "2", "3", ">3"),
+           Category = c(rep("TFs", 4), rep("Non-TFs", 4)),
+           Number.frequency = c(dominant.isoforms.tfs.freqs %>% filter(dominant.isoforms.n == 1) %>% pull(dominant.isoforms.n.freq),
+                                dominant.isoforms.tfs.freqs %>% filter(dominant.isoforms.n == 2) %>% pull(dominant.isoforms.n.freq),
+                                dominant.isoforms.tfs.freqs %>% filter(dominant.isoforms.n == 3) %>% pull(dominant.isoforms.n.freq),
+                                sum(dominant.isoforms.tfs.freqs %>% filter(dominant.isoforms.n > 3) %>% pull(dominant.isoforms.n.freq)),
+                                dominant.isoforms.nontfs.freqs %>% filter(dominant.isoforms.n == 1) %>% pull(dominant.isoforms.n.freq),
+                                dominant.isoforms.nontfs.freqs %>% filter(dominant.isoforms.n == 2) %>% pull(dominant.isoforms.n.freq),
+                                dominant.isoforms.nontfs.freqs %>% filter(dominant.isoforms.n == 3) %>% pull(dominant.isoforms.n.freq),
+                                sum(dominant.isoforms.nontfs.freqs %>% filter(dominant.isoforms.n > 3) %>% pull(dominant.isoforms.n.freq)))) %>%
+  mutate(Dominant.isoforms.number = factor(Dominant.isoforms.number, levels = c(">3", "3", "2", "1"))) %>%
+  mutate(Category = factor(Category, levels = c("TFs", "Non-TFs"))) %>%
+  ggplot(aes(x = Category, y = Number.frequency)) +
+    geom_col(aes(fill = Dominant.isoforms.number)) +
+    theme_classic()
+```
+
+So about 70% of all TFs do not change the dominant isoforms, while another 30% can have 2, 3 or even more different dominant isoforms in different tissues. This supports the suggestion that the same TF gene may have different functions in different tissues.
+
+However, TFs can be tissue-specific or unspecific, and it is interesting to check if TFs from both of these categories switch dominant isoforms across tissues. Let us define TFs with tau in [0; 0.3) as unspecific, those with [0.3; 0.7) as of medium specificity and those with tau in [0.7; 1] as specific and check the distribution of tissue specificity of their isoforms:
+
+```{r, include=T}
+gene.tissue.specificity = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_ts_final.tsv",
+                                     header = T,
+                                     sep = "\t",
+                                     stringsAsFactors = F)
+
+tfs.specificity.dominant = dominant.isoforms.tfs %>%
+  left_join(gene.tissue.specificity, by = "ensembl_gene_id") %>%
+  mutate(specificity.group = ifelse(tissue_specificity < 0.3,
+                                    "Low",
+                                    ifelse((tissue_specificity >= 0.3) & (tissue_specificity < 0.7),
+                                           "Medium",
+                                           "High"))) %>%
+  dplyr::select(ensembl_gene_id, dominant.isoforms.n, specificity.group, tissue_specificity)
+
+low.n = tfs.specificity.dominant %>%
+  filter(specificity.group == "Low") %>%
+  nrow()
+
+medium.n = tfs.specificity.dominant %>%
+  filter(specificity.group == "Medium") %>%
+  nrow()
+
+high.n = tfs.specificity.dominant %>%
+  filter(specificity.group == "High") %>%
+  nrow()
+
+tfs.specificity.dominant.low.freq = tfs.specificity.dominant %>%
+  filter(specificity.group == "Low") %>%
+  group_by(dominant.isoforms.n) %>%
+    mutate(dominant.isoforms.n.freq = length(ensembl_gene_id) / low.n) %>%
+  ungroup() %>%
+  dplyr::select(dominant.isoforms.n, dominant.isoforms.n.freq) %>% 
+  distinct() %>% 
+  arrange(dominant.isoforms.n)
+
+tfs.specificity.dominant.medium.freq = tfs.specificity.dominant %>%
+  filter(specificity.group == "Medium") %>%
+  group_by(dominant.isoforms.n) %>%
+    mutate(dominant.isoforms.n.freq = length(ensembl_gene_id) / medium.n) %>%
+  ungroup() %>%
+  dplyr::select(dominant.isoforms.n, dominant.isoforms.n.freq) %>% 
+  distinct() %>% 
+  arrange(dominant.isoforms.n)
+
+tfs.specificity.dominant.high.freq = tfs.specificity.dominant %>%
+  filter(specificity.group == "High") %>%
+  group_by(dominant.isoforms.n) %>%
+    mutate(dominant.isoforms.n.freq = length(ensembl_gene_id) / high.n) %>%
+  ungroup() %>%
+  dplyr::select(dominant.isoforms.n, dominant.isoforms.n.freq) %>% 
+  distinct() %>% 
+  arrange(dominant.isoforms.n)
+
+data.frame(Dominant.isoforms.number = c("1", "2", "3", ">3", "1", "2", "3", ">3", "1", "2", "3", ">3"),
+           Category = c(rep("Low", 4), rep("Medium", 4), rep("High", 4)),
+           Number.frequency = c(tfs.specificity.dominant.low.freq %>% filter(dominant.isoforms.n == 1) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.low.freq %>% filter(dominant.isoforms.n == 2) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.low.freq %>% filter(dominant.isoforms.n == 3) %>% pull(dominant.isoforms.n.freq),
+                                sum(tfs.specificity.dominant.low.freq %>% filter(dominant.isoforms.n > 3) %>% pull(dominant.isoforms.n.freq)),
+                                tfs.specificity.dominant.medium.freq %>% filter(dominant.isoforms.n == 1) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.medium.freq %>% filter(dominant.isoforms.n == 2) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.medium.freq %>% filter(dominant.isoforms.n == 3) %>% pull(dominant.isoforms.n.freq),
+                                sum(tfs.specificity.dominant.medium.freq %>% filter(dominant.isoforms.n > 3) %>% pull(dominant.isoforms.n.freq)),
+                                tfs.specificity.dominant.high.freq %>% filter(dominant.isoforms.n == 1) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.high.freq %>% filter(dominant.isoforms.n == 2) %>% pull(dominant.isoforms.n.freq),
+                                tfs.specificity.dominant.high.freq %>% filter(dominant.isoforms.n == 3) %>% pull(dominant.isoforms.n.freq),
+                                sum(tfs.specificity.dominant.high.freq %>% filter(dominant.isoforms.n > 3) %>% pull(dominant.isoforms.n.freq)))) %>%
+  mutate(Dominant.isoforms.number = factor(Dominant.isoforms.number, levels = c(">3", "3", "2", "1"))) %>%
+  mutate(Category = factor(Category, levels = c("Low", "Medium", "High"))) %>%
+  ggplot(aes(x = Category, y = Number.frequency)) +
+    geom_col(aes(fill = Dominant.isoforms.number)) +
+    theme_classic()
+```
+
+Low and highly-specific TFs that switch their dominant isoforms across tissues are equally frequent. Hence, although expressed everywhere at roughly the same level, unspecific TF genes may have different functions in different tissues (via expressing different dominant isoforms), and specific TF genes may also act differently depending on whether its their tissue of specificity or not.
+
+Count tissues where TFs of different specificity are expressed:
+
+```{r, include=T}
+count_tissues_where_expressed = function(df) {
+  df = df %>%
+    dplyr::select(-ensembl_gene_id,
+                  -tissue_specificity,
+                  -specificity_group)
+  
+  gene.expression.list = as.numeric(df[1, ])
+  
+  return(length(gene.expression.list[gene.expression.list > 1]))
+}
+
+gene.expression = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_samples_genes_tpm_log2_med_final.tsv",
+                                header = T,
+                                sep = "\t",
+                                stringsAsFactors = F)
+
+gene.tissue.specificity.nexpressed = gene.tissue.specificity %>% 
+  mutate(specificity_group = ifelse(tissue_specificity < 0.3,
+                                    "Low",
+                                    ifelse((tissue_specificity >= 0.3) & (tissue_specificity < 0.7),
+                                           "Medium",
+                                           "High"))) %>%
+  left_join(gene.expression %>%
+              rownames_to_column("ensembl_gene_id"),
+            by = "ensembl_gene_id") %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., tissue_count = count_tissues_where_expressed(.))) %>%
+  ungroup()
+
+gene.tissue.specificity.nexpressed %>%
+  dplyr::select(ensembl_gene_id,
+                specificity_group,
+                tissue_count) %>%
+  group_by(specificity_group) %>%
+  mutate(avg_tissue_count = mean(tissue_count)) %>%
+  ungroup() %>%
+  dplyr::select(specificity_group, avg_tissue_count) %>%
+  distinct()
+
+head(gene.tissue.specificity.nexpressed)
+```
+
+Let us check if dominant isoform switching is specific to any particular TF families:
+
+```{r, include=T, fig.width=10, fig.height=5}
+tf.family.table = read.delim("data/results/tf_family_table.tsv",
+                             header = T,
+                             sep = "\t",
+                             stringsAsFactors = F)
+
+tfs.switching.in.families = tfs.specificity.dominant %>%
+  left_join(tf.family.table,
+            by = "ensembl_gene_id") %>%
+  dplyr::select(-specificity.group, 
+                -tissue_specificity, 
+                -ensembl_transcript_id) %>%
+  distinct()
+
+tf.family.names = tf.family.table %>%
+  pull(tf_family) %>%
+  unique()
+
+switch.fraction.per.family = data.frame(family.name = tf.family.names,
+                                        switch.fraction = rep(0, length(tf.family.names)),
+                                        stable.fraction = rep(0, length(tf.family.names)),
+                                        stringsAsFactors = F)
+
+for (family.name in tf.family.names) {
+  family.size = tfs.switching.in.families %>%
+    filter(tf_family == family.name) %>%
+    nrow()
+  
+  switching.n = tfs.switching.in.families %>%
+    filter(tf_family == family.name) %>%
+    filter(dominant.isoforms.n > 1) %>%
+    nrow()
+  
+  switch.fraction = switching.n / family.size
+  
+  stable.fraction = 1 - switch.fraction
+  
+  switch.fraction.per.family[switch.fraction.per.family$family.name == family.name, "switch.fraction"] = switch.fraction
+  
+  switch.fraction.per.family[switch.fraction.per.family$family.name == family.name, "stable.fraction"] = stable.fraction
+  
+  switch.fraction.per.family[switch.fraction.per.family$family.name == family.name, "family.name"] = paste0(family.name, " (", family.size, ")")
+}
+
+switch.fraction.per.family = switch.fraction.per.family %>%
+  arrange(switch.fraction)
+
+data.frame(Family.Name = rep(switch.fraction.per.family$family.name, 2),
+           Category = c(rep("Switching", length(tf.family.names)), 
+                        rep("Stable", length(tf.family.names))),
+           Fraction = c(switch.fraction.per.family$switch.fraction,
+                        switch.fraction.per.family$stable.fraction)) %>%
+  mutate(Family.Name = factor(Family.Name, levels = unique(Family.Name))) %>%
+  mutate(Category = factor(Category, levels = c("Stable", "Switching"))) %>%
+  ggplot(aes(x = Family.Name, y = Fraction)) +
+    geom_col(aes(fill = Category)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Hence, switching of dominant isoforms is not characteristic to a particular TF family. Families where all TFs switch or do not switch dominant isoforms have a small number of factors (more than half of them have just one TF), while more populated families have both types of TFs in any proportion.
+
+Possible roles of different dominant isoforms can be predicted based on domains they contain. First of all, let us check if TFs can lose a DBD when switching dominant isoforms:
+
+```{r, include=T}
+is_pos_neg_switch = function(df) {
+  df = df %>%
+    dplyr::select(-ensembl_gene_id,
+                  -dominant.isoforms.n, 
+                  -dominant.isoforms.n.freq)
+  
+  dom.isof.list = unique(as.character(df[1, ]))
+  
+  nondbd.isof.n = length(dom.isof.list[dom.isof.list %in% nondbd.isoforms$ensembl_transcript_id])
+  
+  return((nondbd.isof.n > 0) & 
+         (length(dom.isof.list) - nondbd.isof.n > 0))
+}
+
+dbd.negative = read.delim("data/results/isoforms_no_dbd_list.tsv",
+                          header = T,
+                          sep = "\t",
+                          stringsAsFactors = F)
+
+names(dbd.negative) = c("ensembl_transcript_id")
+
+domainless.isoforms = read.delim("data/results/isoforms_no_domains_list.tsv",
+                                 header = T,
+                                 sep = "\t",
+                                 stringsAsFactors = F)
+
+names(domainless.isoforms) = c("ensembl_transcript_id")
+
+nondbd.isoforms = rbind(dbd.negative, domainless.isoforms)
+
+tfs.switching.in.families.dbd = tfs.switching.in.families %>%
+  left_join(tfs.specificity.dominant,
+            by = c("ensembl_gene_id", "dominant.isoforms.n")) %>%
+  dplyr::select(ensembl_gene_id,
+                humantfs_gene_name,
+                tf_family,
+                dominant.isoforms.n,
+                specificity.group) %>%
+  filter(dominant.isoforms.n > 1)
+
+switch.df = dominant.isoforms.tfs %>%
+  filter(dominant.isoforms.n > 1) %>%
+  group_by(ensembl_gene_id) %>%
+  do(mutate(., pos.neg.switch = is_pos_neg_switch(.))) %>%
+  ungroup() %>%
+  dplyr::select(ensembl_gene_id,
+                pos.neg.switch)
+
+tfs.switching.in.families.dbd = tfs.switching.in.families.dbd %>%
+  left_join(switch.df,
+            by = "ensembl_gene_id")
+
+dbd.lost.freq = (tfs.switching.in.families.dbd %>% 
+                   filter(pos.neg.switch) %>% 
+                   nrow()) / 
+  nrow(tfs.switching.in.families.dbd)
+
+p = data.frame(Group = c("TFs", "TFs"),
+               Category = c("DBD lost", "DBD retained"),
+               Fraction = c(dbd.lost.freq, 1 - dbd.lost.freq)) %>%
+  ggplot(aes(x = Group, y = Fraction)) +
+    geom_col(aes(fill = Category)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ggsave("analysis/plots/DBD_presence_absence_switch_in_dominant_isoforms.pdf", p, width = 3, height = 3)
+```
+
+Check if specific and unspecific TFs have different proportions of TFs who lose a DBD when switching dominant isoforms:
+
+```{r, include=T}
+tfs.switching.in.families.dbd.low = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "Low")
+
+tfs.switching.in.families.dbd.medium = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "Medium")
+
+tfs.switching.in.families.dbd.high = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "High")
+
+dbd.lost.freq.low = (tfs.switching.in.families.dbd.low %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.low)
+
+dbd.lost.freq.medium = (tfs.switching.in.families.dbd.medium %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.medium)
+
+dbd.lost.freq.high = (tfs.switching.in.families.dbd.high %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.high)
+
+data.frame(Group = rep(c("Low", "Medium", "High"), 2),
+           Category = c(rep("DBD lost", 3), rep("DBD retained", 3)),
+           Fraction = c(dbd.lost.freq.low, dbd.lost.freq.medium, dbd.lost.freq.high,
+                        1 - dbd.lost.freq.low, 1 - dbd.lost.freq.medium, 1 - dbd.lost.freq.high)) %>%
+  mutate(Group = factor(Group, levels = c("Low", "Medium", "High"))) %>%
+  ggplot(aes(x = Group, y = Fraction)) +
+    geom_col(aes(fill = Category)) + 
+    theme_classic()
+```
+
+The proportion of TFs that lose DBDs in dominant isoforms is comparable across the three specificity groups, although TFs with the medium specificity tend to lose DBDs more frequently.
+
+Next, let us check what percentage of DBD+ and DBD- isoforms gets dominant:
+
+```{r, include=T}
+dominant.isoforms = c()
+
+for (gene.id in dominant.isoforms.tfs$ensembl_gene_id) {
+  df = dominant.isoforms.tfs[dominant.isoforms.tfs$ensembl_gene_id == gene.id, ] %>%
+    dplyr::select(-ensembl_gene_id,
+                  -dominant.isoforms.n, 
+                  -dominant.isoforms.n.freq)
+  
+  dominant.isoforms = c(dominant.isoforms, unique(as.character(df[1, ])))
+}
+
+dominant.isoforms.dbd.minus = dominant.isoforms[dominant.isoforms %in% c(dbd.negative$ensembl_transcript_id,
+                                                                         domainless.isoforms$ensembl_transcript_id)]
+
+dominant.isoforms.dbd = dominant.isoforms[!dominant.isoforms %in% nondbd.isoforms$ensembl_transcript_id]
+
+all.dbd.isoforms = tf.family.table %>%
+  dplyr::select(ensembl_transcript_id) %>%
+  filter(!ensembl_transcript_id %in% nondbd.isoforms$ensembl_transcript_id) %>%
+  pull(ensembl_transcript_id)
+
+data.frame(Group = rep(c("DBD+", "DBD-"), 2),
+           Category = c(rep("Become dominant", 2), rep("Do not become dominant", 2)),
+           Fraction = c(length(dominant.isoforms.dbd) / length(all.dbd.isoforms),
+                        length(dominant.isoforms.dbd.minus) / length(c(dbd.negative$ensembl_transcript_id,
+                                                                       domainless.isoforms$ensembl_transcript_id)),
+                        1 - length(dominant.isoforms.dbd) / length(all.dbd.isoforms),
+                        1 - length(dominant.isoforms.dbd.minus) / length(c(dbd.negative$ensembl_transcript_id,
+                                                                           domainless.isoforms$ensembl_transcript_id)))) %>%
+  mutate(Group = factor(Group, levels = c("DBD+", "DBD-"))) %>%
+  ggplot(aes(x = Group, y = Fraction)) +
+    geom_col(aes(fill = Category)) +
+    theme_classic()
+```
+
+Hence, only about 25% of DBD- isoforms become dominant, while more than a half of all DBD+ isoforms become dominant.
+
+However, we need to check the expression level of DBD- dominant isoforms in the tissues where they are dominant, because they still may become dominant in a tissue at a noise level of expression (this would mean that the corresponding gene may not be expressed in that tissue):
+
+```{r, include=T}
+dominant.isoforms.functional.status = data.frame(ensembl_transcript_id = dominant.isoforms,
+                                                 functional.status = F)
+
+for (i in dominant.isoforms) {
+  i.tissues = names(which(apply(dominant.isoforms.tfs %>%
+                                  dplyr::select(-ensembl_gene_id,
+                                                -dominant.isoforms.n,
+                                                -dominant.isoforms.n.freq), 
+                                2, 
+                                function(c) any(c == i))))
+  
+  i.dominant.expression = sort(isoform.expression[i, i.tissues])
+  
+  dominant.isoforms.functional.status[dominant.isoforms.functional.status$ensembl_transcript_id == i, "functional.status"] = as.logical(any(i.dominant.expression > 1))
+}
+
+dominant.isoforms.functional.status = dominant.isoforms.functional.status %>%
+  mutate(domain.status = ifelse(ensembl_transcript_id %in% dominant.isoforms.dbd.minus,
+                                "DBD-",
+                                "DBD+"))
+
+dominant.isoforms.functional.status.freq = dominant.isoforms.functional.status %>%
+  group_by(functional.status, domain.status) %>%
+  mutate(functional.status.n = length(ensembl_transcript_id)) %>%
+  ungroup() %>%
+  group_by(domain.status) %>%
+  mutate(domain.status.n = length(ensembl_transcript_id)) %>%
+  ungroup() %>%
+  dplyr::select(functional.status, domain.status, functional.status.n, domain.status.n) %>%
+  distinct() %>%
+  mutate(functional.status.freq = functional.status.n / domain.status.n)
+
+dominant.isoforms.functional.status.freq
+
+dominant.isoforms.functional.status.freq %>%
+  mutate(domain.status = factor(domain.status, levels = c("DBD+", "DBD-"))) %>%
+  ggplot(aes(x = domain.status, y = functional.status.freq)) +
+    geom_col(aes(fill = functional.status)) +
+    theme_classic()
+```
+
+Next, let us check what percentage of DBD+ and DBD- isoforms is expressed if we calculate the expression as the mean of the top 20% of expression values across all tissues (this mean expression value was calculated for each isoform by Koustav):
+
+```{r, include=T}
+isoform.expression.mean.top20pc.tissues = readRDS("data/results/Koustav/isoform_expression_in_dbd+_and_dbd-_isoforms_considering_on_top_20perc_tissues.rds")
+
+isoforms.to.exclude = tf.ids.filtered %>%
+  # Filter out DBD- isoforms produced by TFs that lost their DBD+ isoforms due to isoform filtering earlier:
+  # AHRR, HOXA1, SETBP1, LCORL, ZNF609, RFX8, ZNF81
+  filter(ensembl_gene_id %in% c("ENSG00000063438", 
+                                "ENSG00000105991", 
+                                "ENSG00000152217", 
+                                "ENSG00000178177", 
+                                "ENSG00000180357", 
+                                "ENSG00000196460", 
+                                "ENSG00000197779")) %>%
+  pull(ensembl_transcript_id) %>%
+  unique()
+
+meanexpr.dbdpos.isof.all.n = isoform.expression.mean.top20pc.tissues %>%
+  filter(!ensembl_transcript_id %in% isoforms.to.exclude) %>%
+  filter(group == "DBD+") %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+meanexpr.dbdpos.isof.expressed.n = isoform.expression.mean.top20pc.tissues %>%
+  filter(!ensembl_transcript_id %in% isoforms.to.exclude) %>%
+  filter(group == "DBD+") %>%
+  filter(mean_expr_in_tissues >= 1) %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+meanexpr.dbdpos.isof.expressed.prop = meanexpr.dbdpos.isof.expressed.n / meanexpr.dbdpos.isof.all.n
+
+meanexpr.dbdneg.isof.all.n = isoform.expression.mean.top20pc.tissues %>%
+  filter(!ensembl_transcript_id %in% isoforms.to.exclude) %>%
+  filter(group == "DBD-") %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+meanexpr.dbdneg.isof.expressed.n = isoform.expression.mean.top20pc.tissues %>%
+  filter(!ensembl_transcript_id %in% isoforms.to.exclude) %>%
+  filter(group == "DBD-") %>%
+  filter(mean_expr_in_tissues >= 1) %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+meanexpr.dbdneg.isof.expressed.prop = meanexpr.dbdneg.isof.expressed.n / meanexpr.dbdneg.isof.all.n
+
+cat("Percent of mean-expressed DBD+ isoforms: ", meanexpr.dbdpos.isof.expressed.prop * 100, "\n")
+
+cat("Percent of mean-expressed DBD- isoforms: ", meanexpr.dbdneg.isof.expressed.prop * 100, "\n")
+
+dominant.isoforms.tfs.ids = unique(unlist(as.data.frame(t(dominant.isoforms.tfs[, 2:(ncol(dominant.isoforms.tfs) - 2)]))))
+
+isoform.expression.mean.top20pc.tissues.expressed = isoform.expression.mean.top20pc.tissues %>%
+  filter(mean_expr_in_tissues >= 1) %>%
+  mutate(dominant = ifelse(ensembl_transcript_id %in% dominant.isoforms.tfs.ids, T, F)) %>%
+  dplyr::select(ensembl_transcript_id, group, dominant) %>%
+  distinct()
+
+dbd.pos.dominant.freq = (isoform.expression.mean.top20pc.tissues.expressed %>%
+                           filter(group == "DBD+" & dominant) %>%
+                           nrow()) /
+                        (isoform.expression.mean.top20pc.tissues.expressed %>%
+                           filter(group == "DBD+") %>%
+                           nrow())
+
+dbd.neg.dominant.freq = (isoform.expression.mean.top20pc.tissues.expressed %>%
+                           filter(group == "DBD-" & dominant) %>%
+                           nrow()) /
+                        (isoform.expression.mean.top20pc.tissues.expressed %>%
+                           filter(group == "DBD-") %>%
+                           nrow())
+
+data.frame(dbd_group = c("DBD+", "DBD+", "DBD-", "DBD-"),
+           dominant = c("True", "False", "True", "False"),
+           fraction = c(dbd.pos.dominant.freq,
+                        1 - dbd.pos.dominant.freq,
+                        dbd.neg.dominant.freq,
+                        1 - dbd.neg.dominant.freq)) %>%
+  ggplot(aes(x = dbd_group, y = fraction)) +
+    geom_col(aes(fill = dominant)) +
+    theme_classic()
+```
+
+See the "*_clustering_clean.Rmd" notebook for the plots of the proportions of DBD+ and DBD- isoforms that are expressed in at least one tissue and get major in at least one tissue.
+
+Check if TFs of different specificity have the DBD- dominant isoforms expressed above the noise level:
+
+```{r, include=T}
+dominant.isoforms.functional.status %>%
+  filter(functional.status) %>%
+  left_join()
+
+tfs.switching.in.families.dbd.low = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "Low")
+
+tfs.switching.in.families.dbd.medium = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "Medium")
+
+tfs.switching.in.families.dbd.high = tfs.switching.in.families.dbd %>%
+  filter(specificity.group == "High")
+
+dbd.lost.freq.low = (tfs.switching.in.families.dbd.low %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.low)
+
+dbd.lost.freq.medium = (tfs.switching.in.families.dbd.medium %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.medium)
+
+dbd.lost.freq.high = (tfs.switching.in.families.dbd.high %>% 
+                       filter(pos.neg.switch) %>% 
+                       nrow()) / 
+  nrow(tfs.switching.in.families.dbd.high)
+
+data.frame(Group = rep(c("Low", "Medium", "High"), 2),
+           Category = c(rep("DBD lost", 3), rep("DBD retained", 3)),
+           Fraction = c(dbd.lost.freq.low, dbd.lost.freq.medium, dbd.lost.freq.high,
+                        1 - dbd.lost.freq.low, 1 - dbd.lost.freq.medium, 1 - dbd.lost.freq.high)) %>%
+  mutate(Group = factor(Group, levels = c("Low", "Medium", "High"))) %>%
+  ggplot(aes(x = Group, y = Fraction)) +
+    geom_col(aes(fill = Category)) + 
+    theme_classic()
+```
+
+```{r, include=T}
+calc_top20percent_max = function(df.row) {
+  count.list = sort(df.row)
+  return(mean(tail(count.list, floor(length(count.list) * 0.2))))
+}
+
+isoform.expression.dominant = data.frame(ensembl_transcript_id = rownames(isoform.expression))
+
+isoform.expression.dominant$top20percent.max.count = apply(isoform.expression, 1, function(x) {calc_top20percent_max(x)})
+
+isoform.expression.dominant = isoform.expression.dominant %>%
+  filter(ensembl_transcript_id %in% dominant.isoforms) %>%
+  mutate(domain.status = ifelse(ensembl_transcript_id %in% dominant.isoforms.dbd.negative,
+                                "DBD-",
+                                ifelse(ensembl_transcript_id %in% dominant.isoforms.domainless,
+                                       "Domainless",
+                                       "DBD+")))
+
+dominant.dbd.top20percent.counts = isoform.expression.dominant %>%
+  filter(domain.status == "DBD+")
+
+dominant.neg.dbd.top20percent.counts = isoform.expression.dominant %>%
+  filter(domain.status == "DBD-")
+
+dominant.domainless.top20percent.counts = isoform.expression.dominant %>%
+  filter(domain.status == "Domainless")
+
+data.frame(Group = c(rep("DBD+", length(dominant.dbd.top20percent.counts$ensembl_transcript_id)), 
+                     rep("DBD-", length(dominant.neg.dbd.top20percent.counts$ensembl_transcript_id)), 
+                     rep("Domainless", length(dominant.domainless.top20percent.counts$ensembl_transcript_id))),
+           Buffered.max.expression = c(dominant.dbd.top20percent.counts$top20percent.max.count,
+                                       dominant.neg.dbd.top20percent.counts$top20percent.max.count,
+                                       dominant.domainless.top20percent.counts$top20percent.max.count)) %>%
+  mutate(Group = factor(Group, levels = c("DBD+", "DBD-", "Domainless"))) %>%
+  ggplot(aes(x = Group, y = Buffered.max.expression)) +
+    geom_violin(aes(fill = Group)) +
+    geom_boxplot(aes(fill = Group), width = 0.1) +
+    geom_hline(aes(yintercept = 1), linetype="dashed") +
+    theme_classic()
+```
+
+Hence, some DBD- and domainless isoforms indeed could be functional, as they can be dominant isoforms which are expressed above the noise level.
+
+Numbers of DBD- and domainless isoforms that are not noise:
+
+```{r, include=T}
+cat("DBD-:", 
+    dominant.isoforms.functional.status.freq %>% 
+      filter(functional.status) %>% 
+      filter(domain.status == "DBD-") %>%
+      pull(functional.status.n), 
+    "\n")
+
+cat("Domainless:", 
+    dominant.isoforms.functional.status.freq %>% 
+      filter(functional.status) %>% 
+      filter(domain.status == "Domainless") %>%
+      pull(functional.status.n), 
+    "\n")
+```
+
+Generate plots of isoform expression across tissues in all TFs where at least one DBD- isoform is expressed as dominant (above the noise level) in at least one tissue:
+
+```{r, include=T}
+dominant.expressed.dbd.minus = dominant.isoforms.functional.status %>% 
+  filter(functional.status) %>% 
+  filter(domain.status == "DBD-") %>%
+  pull(ensembl_transcript_id)
+
+dominant.expressed.dbd.minus = droplevels(dominant.expressed.dbd.minus)
+
+tfs.with.dominant.expressed.dbd.minus = tf.family.table %>%
+  filter(ensembl_transcript_id %in% dominant.expressed.dbd.minus) %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+tissue_names = names(isoform.expression)
+
+#gene.id = "ENSG00000089775"
+
+i = 0
+
+for (gene.id in tfs.with.dominant.expressed.dbd.minus) {
+  i = i + 1
+  if (i %% 10 == 0) {
+    cat(i, "\n")
+  }
+  
+  gene.name = tf.family.table %>%
+    filter(ensembl_gene_id == gene.id) %>%
+    pull(humantfs_gene_name) %>%
+    unique()
+  
+  plot.name = paste0(gene.name, "_", gene.id, ".pdf")
+  
+  gene.id.isoforms = tf.family.table %>%
+    filter(ensembl_gene_id == gene.id) %>%
+    pull(ensembl_transcript_id)
+  
+  gene.id.isoforms.expression = isoform.expression[rownames(isoform.expression) %in% gene.id.isoforms, ]
+  
+  gene.id.isoforms.expression = gene.id.isoforms.expression %>%
+    rownames_to_column("ensembl_transcript_id") %>%
+    mutate(domain_status = ifelse(ensembl_transcript_id %in% c(dbd.negative$ensembl_transcript_id,
+                                                               domainless.isoforms$ensembl_transcript_id),
+                                  "DBD-",
+                                  "DBD+"))
+
+  gene.id.isoforms.expression.toplot = data.frame(ensembl_transcript_id = unlist(purrr::map(gene.id.isoforms.expression$ensembl_transcript_id, 
+                                                       function(x) {rep(x, length(tissue_names))})),
+             tissue_name = rep(tissue_names, length(gene.id.isoforms.expression$ensembl_transcript_id)),
+             transcript_count = as.numeric(paste(t(gene.id.isoforms.expression %>% 
+                                                     dplyr::select(-ensembl_transcript_id,
+                                                                   -domain_status)))),
+             domain_status = unlist(purrr::map(gene.id.isoforms.expression$domain_status, 
+                                               function(x) {rep(x, length(tissue_names))})),
+             stringsAsFactors = F)
+  
+  max.y = floor(max(gene.id.isoforms.expression.toplot$transcript_count)) + 1
+  
+  p = ggplot(data = gene.id.isoforms.expression.toplot, 
+             aes(x = tissue_name, 
+                 y = transcript_count,
+                 group = ensembl_transcript_id)) +
+      geom_line(aes(color = domain_status)) +
+      geom_hline(yintercept = 1, linetype = "dashed") +
+      scale_y_discrete(limits = c(0, max.y), scales::pretty_breaks(max.y + 1)(0:max.y)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  
+  p
+  
+  ggsave(paste0("analysis/plots/tf_isoform_expression_examples_with_dbd_minus/", plot.name), 
+         p, 
+         width = 10,
+         height = 5)
+}
+```
+
+Check known examples of TFs who have isoforms with and without a DBD or with different DBD sequences:
+
+```{r, include=T}
+tissue_names = names(isoform.expression)
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl = read.table(file = "data/results/domain_analysis/tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl.tsv",
+            sep = "\t",
+            quote = "\"",
+            header = T)
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected = read.table(file = "data/results/domain_analysis/tf_coding_transcripts_final_ens99_with_fam_names_corrected.tsv",
+            sep = "\t",
+            quote = "\"",
+            header = T)
+
+isoform.expression.all = read.delim("data/results/gtex8_processed/tfs_nontfs_selected_table_tpm_whole_log2_med.tsv",
+                                    header = T,
+                                    sep = "\t",
+                                    stringsAsFactors = F)
+
+ensg_enst_tsl = read.delim("data/ensembl99/ensg_enst_tsl_99.tsv",
+                                    header = T,
+                                    sep = "\t",
+                                    stringsAsFactors = F)
+
+make_line_plot = function(gene.name, filtered) {
+  gene.id = tf.family.table %>%
+    filter(humantfs_gene_name == gene.name) %>%
+    pull(ensembl_gene_id)
+  
+  plot.name = paste0(gene.name, "_", 
+                     gene.id, 
+                     ifelse(filtered, "_selected_isoforms", "_all_isoforms"),
+                     ".pdf")
+  
+  if(filtered) {
+    gene.id.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+      filter(ensembl_gene_id == gene.id) %>%
+      pull(ensembl_transcript_id) %>%
+      unique()
+  } else {
+    gene.id.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+      filter(ensembl_gene_id == gene.id) %>%
+      pull(ensembl_transcript_id) %>%
+      unique()
+  }
+  
+  gene.id.isoforms.expression = isoform.expression.all[rownames(isoform.expression.all) %in% gene.id.isoforms, ]
+  
+  gene.id.isoforms.expression = gene.id.isoforms.expression %>%
+    rownames_to_column("ensembl_transcript_id") %>%
+    mutate(domain_status = ifelse(ensembl_transcript_id %in% c(dbd.negative$ensembl_transcript_id,
+                                                               domainless.isoforms$ensembl_transcript_id),
+                                  "DBD-",
+                                  "DBD+"))
+
+  gene.id.isoforms.expression.toplot = data.frame(ensembl_transcript_id = unlist(purrr::map(gene.id.isoforms.expression$ensembl_transcript_id, 
+                  function(x) {rep(x, length(tissue_names))})),
+             tissue_name = rep(tissue_names, length(gene.id.isoforms.expression$ensembl_transcript_id)),
+             transcript_count = as.numeric(paste(t(gene.id.isoforms.expression %>% 
+                                                     dplyr::select(-ensembl_transcript_id,
+                                                                   -domain_status)))),
+             domain_status = unlist(purrr::map(gene.id.isoforms.expression$domain_status, 
+                                               function(x) {rep(x, length(tissue_names))})),
+             stringsAsFactors = F)
+  
+  max.y = floor(max(gene.id.isoforms.expression.toplot$transcript_count)) + 1
+  
+  p = ggplot(data = gene.id.isoforms.expression.toplot, 
+             aes(x = tissue_name, 
+                 y = transcript_count,
+                 group = ensembl_transcript_id)) +
+      geom_line(aes(color = ensembl_transcript_id)) +
+      geom_hline(yintercept = 1, linetype = "dashed") +
+      scale_y_discrete(limits = c(0, max.y), scales::pretty_breaks(max.y + 1)(0:max.y)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  
+  ggsave(paste0("analysis/plots/tf_isoform_expression_examples_known/", plot.name), 
+         p, 
+         width = 10,
+         height = 5,
+         devic = "pdf")
+  
+  return(p)
+}
+
+make_domain_table = function(gene.name, filtered) {
+  gene_id = tf.family.table %>%
+    filter(humantfs_gene_name == gene.name) %>%
+    pull(ensembl_gene_id)
+  
+  if (filtered) {
+    gene_table = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+      filter(ensembl_gene_id == gene_id)
+  } else {
+    gene_table = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+      filter(ensembl_gene_id == gene_id)
+  }
+  
+  comparison_table = gene_table %>%
+    dplyr::select(humantfs_gene_name, ensembl_gene_id, ipr_description, ipr_accession, domain_type) %>%
+    distinct()
+  
+  gene_transcripts = gene_table %>% pull(ensembl_transcript_id) %>% unique()
+  
+  for (tx in gene_transcripts) {
+    domain_counts = gene_table %>%
+      filter(ensembl_transcript_id == tx) %>%
+      dplyr::select(ipr_accession) %>%
+      group_by(ipr_accession) %>%
+      mutate(n = n()) %>%
+      distinct()
+    
+    domain_counts[tx] = domain_counts$n
+    
+    domain_counts = domain_counts %>%
+      dplyr::select(-n)
+    
+    comparison_table = comparison_table %>%
+      left_join(domain_counts, by = c("ipr_accession"))
+  }
+  
+  comparison_table = comparison_table %>%
+    mutate_at(vars(-c("humantfs_gene_name",
+                      "ensembl_gene_id",
+                      "ipr_description",
+                      "ipr_accession",
+                      "domain_type")), 
+              ~replace(., is.na(.), 0))
+  
+  return(comparison_table)
+}
+```
+
+Generate line plots of TF isoform expression for known examples and save the plots in PDF:
+
+```{r, include=T}
+for (gene.name in c("REST", "FOXP1", "HOXA1", "HOXB6", "CREM", "PAX8", "TEAD4", "ZNF215", "HOXA9")) {
+  make_line_plot(gene.name, T)
+  make_line_plot(gene.name, F)
+}
+```
+
+Read the table of TF isoforms with numbers of DBDs:
+
+```{r, include=T}
+# Load the table of all TF isoforms with the numbers of canonical DBDs:
+base.table = read.delim("data/results/base_dbd_expression_analysis_table.tsv",
+                          header = T,
+                          sep = "\t",
+                          stringsAsFactors = F)
+```
+
+Check expression of DBD+ and DBD- TF isoforms:
+
+```{r}
+gene.name = "PRDM2"
+  
+gene.isoforms = base.table %>%
+  filter(humantfs_gene_name == gene.name) %>%
+  pull(ensembl_transcript_id)
+
+gene.isoforms.expression = isoform.expression.all[rownames(isoform.expression.all) %in% gene.isoforms, ]
+
+gene.isoforms.expression %>%
+  tibble::rownames_to_column() %>%
+  dplyr::select(rowname, Stomach) %>%
+  left_join(base.table %>%
+              filter(humantfs_gene_name == gene.name) %>%
+              dplyr::select(ensembl_transcript_id, n_dbd),
+            by = c("rowname" = "ensembl_transcript_id")) %>%
+  arrange(desc(Stomach))
+
+base.table %>%
+  filter(n_dbd == 0) %>%
+  pull(ensembl_transcript_id) %>%
+  unique() %>%
+  length()
+
+length(unique(c(dbd.negative$ensembl_transcript_id, domainless.isoforms$ensembl_transcript_id)))
+```
+
+Consider the known examples one by one:
+
+1. REST is a transcription repressor that has two isoforms: one full, with 9 C2H2 ZFs and a repressor domain, and the other truncated (REST4), lacking 4 C2H2 ZFs and the repressor domain. The full isoform binds DNA and represses REST's target genes, while the truncated one cannot bind DNA. Hence, the production of the truncated isoform activates REST's targets. It happens in neural progenitors when it's time for them to start to differetiate into neurons [Raj et al., 2011](https://www.sciencedirect.com/science/article/pii/S1097276511006320?via%3Dihub). So we would expect that the full isoform is present in all tissues, except for neurons, to repress the neurogenesis genes, while the truncated one may or may not be still present in differentiated neurons.
+
+```{r, include=T}
+make_line_plot("REST", T)
+#make_line_plot("REST", F)
+make_domain_table("REST", T)
+#make_domain_table("REST", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "REST") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+So, ENST00000309042 and ENST00000619101 represent the full protein isoform, while ENST00000611211 and ENST00000640343 represent the truncated one (REST4). It's interesting that there are another two truncated isoforms, ENST00000622863 and ENST00000640168. They have one C2H2 ZF fewer than REST4. 
+
+The plot shows that only the full isoforms, ENST00000619101 and ENST00000309042, are expressed in differentiated tissues. They are expressed across all tissues, except for the brain where no isoforms are expressed (only one of the two full isoforms is expressed in the spinal cord cervical). This expression profile matches the expectation.
+
+2. HOXA9:
+
+```{r, include=T}
+make_line_plot("HOXA9", T)
+#make_line_plot("HOXA9", F)
+make_domain_table("HOXA9", T)
+#make_domain_table("HOXA9", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "HOXA9") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+The DBD+ isoforms ENST00000673917 and ENST00000673744 were filtered out because they do not have a TSL flag. But they are also not present in GTEx. Otherwise, we indeed expect to see a DBD+ (ENST00000343483) and a DBD- (ENST00000396345) isoform. According to previous results from mouse (https://www.sciencedirect.com/science/article/pii/S0378111998000146), the DBD+ and DBD- isoforms would be co-expressed in kidney and large intestine and neither of them would be expressed in the brain, stomach, small intestine, liver, spleen or testis. However, we do not have kidney or large intestine here (and so we need to check the filtering criteria for the tissues!); on the other hand, the two isoforms are indeed not expressed in stomach, spleen, testis, brain, liver, but are both expressed in the terminal illeum of the small intestine. They are also expressed in some tissues that were not studied before: subcutaneous adipose tissue, adrenal gland, tibial artery, breas mammary tissue, colon, skeletal muscle, tibial nerve, prostate, skin, uterus and vagina. It is interesting that the DBD+ and DBD- isoforms are always co-expressed (possible functional significance of this co-expression is not as yet known).
+
+3. FOXP1:
+
+```{r, include=T}
+make_line_plot("FOXP1", T)
+#make_line_plot("FOXP1", F)
+make_domain_table("FOXP1", T)
+#make_domain_table("FOXP1", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "FOXP1") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+One DBD+ isoform of FOXP1 promotes pluripotency while another DBD+ isoform activates transcription of differentiation genes (https://www.sciencedirect.com/science/article/pii/S0092867411009494?via%3Dihub). So we would expect the latter isoform to be expressed in differentiated tissues. Indeed, isoform ENST00000614176 which is dominant in all tissues, has a DBD, and the DBD sequence matches the one that facilitates activation of the differentiation genes. Interestingly, a couple of other DBD+ isoforms, ENST00000493089 and ENST00000318789, are expressed in some tissues (clearly excluding brain), and both of them also have the differentiation-promoting DBD sequence. Also a DBD- isoform, ENST00000318779, is expressed in prostate and testis. Additionally, a DBD- isoform ENST00000622151 expressed specifically in testis, was filtered out because of its TSL3 flag; however, the isoform is included in the GENCODE basic set.
+
+Partially match expectations:
+
+4. TEAD4:
+
+```{r, include=T}
+make_line_plot("TEAD4", T)
+#make_line_plot("TEAD4", F)
+make_domain_table("TEAD4", T)
+#make_domain_table("TEAD4", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "TEAD4") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+TEAD4 is a transcription activator that, with the YAP cofactor, controls tissue growth by taking part in the Hippo-YAP signalling. This TF has two isoforms: one full (with a DBD, TEAD4-FL) and the other truncated (without a DBD, TEAD4-S). These two isoforms, when coexpressed, compete for YAP binding, in this way regulating the outcome of the Hippo-YAP pathway [Qi et al., 2016](https://www.nature.com/articles/ncomms11840). The authors of this paper discovered that TEAD4-FL is the major isoform in all tissues they studied (brain, colon, liver, kidney, heart, lung, smooth muscles, pancreas, spleen, stomach) and it is co-expressed with TEAD4-S in these tissues. The authors detected the two TEAD4 isoforms in these tissues both at the mRNA (Fig. S1C) and protein (Fig. S1D) levels. Hence, we expect to find both isoforms in these tissues, TEAD4-FL being the major one.
+
+The table of TEAD4 isoforms with the number of canonical DBDs is as follows:
+
+```{r, include=T}
+base.table %>%
+  filter(humantfs_gene_name == "TEAD4")
+```
+
+So, ENST00000358409 and ENST00000359864 represent TEAD4-FL, while ENST00000397122 represents TEAD4-S. 
+
+The plot for TEAD4 shows that TEAD4-FL, represented by ENST00000359864, is indeed the major isoform in all tissues selected from GTEx, including the ones outlined above (apart from kidney which is not present here). However, in the brain (except for the cerebellum) and in liver TEAD4-FL (and TEAD4-S as well) is not expressed (is under the threshold of 1 TPM). In turn, TEAD4-S is indeed co-expressed with TEAD4-FL in one of the two heart tissues (atrial appendage), lung and pancreas, but it is not expressed in the brain, colon, liver, smooth muscles (represened, for example, by arteries, the small intestine terminal illeum and uterus), spleen and stomach. So, the difference with the earlier resutls is quite dramatic. It could be due to Qi et al. picking mRNA and protein background. Alternatively, it could be due to possible incorrect isoform quantification by RSEM.
+
+Interestingly, TEAD4-S (represented by ENST00000397122) is tightly co-expressed with TEAD4-FL (represented by ENST00000359864) in particular tissues (lung, skeletal muscle, pancreas) but less so in other tissues (skin, thyroid, esophagus, heart, adipose tissue), while is not expressed at all in yet another, quite substantial, subset of tissues where TEAD4-FL is expressed alone (brain, breast, colon, some esophagus subtissues, minor salivary gland, neve tibial, ovary, small intestine terminal illeum, spleen, stomach, testis, uterus, vagina). In the first group of tissues (where TEAD4-FL and TEAD4-S are tightly co-expressed) we expect TEAD4 target genes to be repressed due to the competition between the two isoforms for YAP binding. On the contrary, in the other two groups (where TEAD4-FL is expressed alone or is co-expressed with scarcely present TEAD4-S) TEAD4 targets are activated because TEAD4-FL can bind YAP without competition.
+
+5. PAX8:
+
+```{r, include=T}
+make_line_plot("PAX8", T)
+#make_line_plot("PAX8", F)
+make_domain_table("PAX8", T)
+#make_domain_table("PAX8", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "PAX8") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+PAX8 is expected to have at least two alternative isoforms with different DBD sequences. Both are expressed in human kidney cell lines but not in testis (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1170283/). Indeed, in our data we have five DBD+ isoforms (ENST00000465084 is DBD-), and they are indeed not expressed in testis (although ENST00000348715 might be). Unfortunately, we cannot check kidney as we do not have this tissue here. Interestingly, all these isoforms, including the DBD- one, are co-expressed in thyroid, which has not been shown before.
+
+Do not match expectations:
+
+6. HOXB6:
+
+```{r, include=T}
+make_line_plot("HOXB6", T)
+#make_line_plot("HOXB6", F)
+make_domain_table("HOXB6", T)
+#make_domain_table("HOXB6", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "HOXB6") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+HOXB6 is expected to have a DBD+ and a DBD- isoform. The exact function of the DBD- isoform is not known. According to previously published data from mouse (https://academic.oup.com/nar/article/19/3/539/1033821), the two isoforms are expected to be co-expressed in kidney, uterus and spinal cord (to the lesser extent). On the other hand, the TF is not expected to be expressed in spleen, liver, brain, heart or testis. However, Ensembl99 annotation (and GTEx as well) does not have a DBD- isoform at all! Both isoforms are DBD+. There are a couple of short isoforms present in Ensembl and GTEx, but they are non-coding. So, current genomic data do not support previous suggestion of the existence of a DBD- isoform of this TF.
+
+7. ZNF215:
+
+```{r, include=T}
+make_line_plot("ZNF215", T)
+make_line_plot("ZNF215", F)
+make_domain_table("ZNF215", T)
+make_domain_table("ZNF215", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "ZNF215") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+According to literature, ZNF215 should have at least one DBD+ and at least two DBD- isoforms (https://www.cell.com/ajhg/fulltext/S0002-9297%2807%2962977-2). DBD+ should be expressed in kidney, liver and placenta, while the DBD- isoform should be expressed in kidney and brain (Fig. 3b). Additionally, RefSeq says (according to the citation in GeneCards), that the TF should preferrably be expressed in testis (https://www.genecards.org/cgi-bin/carddisp.pl?gene=ZNF215&keywords=znf215). Indeed, in our data the TF has a DBD+ (ENST00000278319) and a DBD- (ENST00000529903) isoform, but both of them are almost not expressed. Additional DBD+ (ENST00000414517) and DBD- (ENST00000610573) isoforms were filtered out because of their TSL5 flag, but both of them are not expressed. So, the TF might have worked in development but then got turned off. All the four isoforms are from the GENCODE basic set. One DBD+ isoform is expressed only in the terminal ileum of the small intestine and possibly in testis.
+
+8. HOXA1:
+
+```{r, include=T}
+make_line_plot("HOXA1", T)
+make_line_plot("HOXA1", F)
+make_domain_table("HOXA1", T)
+make_domain_table("HOXA1", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "HOXA1") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+The only DBD+ isoform, ENST00000643460, was filtered out because it does not have a TSL flag. Moreover, this isoform is not present in GTEx. So we cannot study this TF with the data at hand. We would need to change the filtering criteria (probably, taking on isoforms with the GENCODE basic flag) and re-quantify GTEx samples using Ensembl99. If coexpressed with DBD+, DBD- isoform would attenuate transcription activated by the DBD+ isoform as was shown for mouse Hoxa1 in vitro (https://onlinelibrary.wiley.com/doi/full/10.1002/jcb.22023).
+
+Have not checked expectations yet:
+
+9. PAX4:
+
+```{r, include=T}
+make_line_plot("PAX4", T)
+make_line_plot("PAX4", F)
+make_domain_table("PAX4", T)
+make_domain_table("PAX4", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "PAX4") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+PAX4 is crucial during fetal development, and it's activity in development rather than in differentiated tissues could explain the fact that its isoforms are not expressed in GTEx.
+
+Count coding TF isoforms present in Ensembl99 and in GTEx8 (Ensembl88):
+
+```{r, include=T}
+base.table = read.delim("data/results/base_dbd_expression_analysis_table.tsv",
+                          header = T,
+                          sep = "\t",
+                          stringsAsFactors = F)
+
+tf_coding_isoforms_ens99 = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% 
+  filter(!DBD %in% c("Unknown", "Excluded")) %>% 
+  pull(ensembl_transcript_id) %>% 
+  unique()
+
+ensembl88 = useEnsembl(biomart = "ensembl",
+                       dataset = "hsapiens_gene_ensembl",
+                       version = "88")
+
+ensg_enst_tsl88 = getBM(attributes = c("ensembl_gene_id",
+                                       "ensembl_transcript_id",
+                                       "transcript_tsl",
+                                       "transcript_gencode_basic",
+                                       "transcript_appris",
+                                       # "transcript_mane_select",
+                                       "ccds"),
+                      filters = "transcript_biotype",
+                      values = "protein_coding",
+                      mart = ensembl88)
+write.table(ensg_enst_tsl88,
+            file = "data/ensembl88/ensg_enst_tsl_88.tsv",
+            quote = F, sep = "\t", row.names = F)
+
+# GTEx8 is based on GENCODE 26 (see https://www.gtexportal.org/home/releaseInfoPage), 
+# which, in turn, is equivalent to Ensembl 88 
+# (see https://genome.ucsc.edu/cgi-bin/hgTrackUi?db=hg38&g=wgEncodeGencodeSuper)
+ensg_enst_tsl88 = read.delim("data/ensembl88/ensg_enst_tsl_88.tsv",
+                             stringsAsFactors = F) %>%
+  dplyr::select(ensembl_gene_id,
+                ensembl_transcript_id,
+                transcript_tsl,
+                # transcript_mane_select,
+                transcript_gencode_basic,
+                transcript_appris,
+                ccds) %>%
+  arrange(ensembl_gene_id,
+          ensembl_transcript_id)
+
+tf_coding_isoforms_ens88 = ensg_enst_tsl88 %>%
+  filter(ensembl_gene_id %in% base.table$ensembl_gene_id) %>%
+  pull(ensembl_transcript_id) %>% 
+  unique()
+
+cat("Number of filtered coding TF isoforms in Ensembl99:", length(tf_coding_isoforms_ens99), "\n")
+cat("Number of all coding TF isoforms in Ensembl88 (GTEx8):", length(tf_coding_isoforms_ens88), "\n")
+cat("Number of isoforms in common:", length(intersect(tf_coding_isoforms_ens99, tf_coding_isoforms_ens88)), "\n")
+cat("Number of isoforms unique to Ensembl99:", length(tf_coding_isoforms_ens99) - length(intersect(tf_coding_isoforms_ens99, tf_coding_isoforms_ens88)), "\n")
+cat("Number of isoforms unique to Ensembl88:", length(tf_coding_isoforms_ens88) - length(intersect(tf_coding_isoforms_ens99, tf_coding_isoforms_ens88)), "\n")
+```
+
+Quality control for TFs in terms of the presence and expression of their isoforms:
+
+1) Are there any TFs with no DBD+ isoforms? (By definition, a TF should have at least one DBD+ isoform.)
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+  group_by(ensembl_gene_id) %>%
+  filter(!"DBD" %in% domain_type) %>%
+  ungroup() %>%
+  dplyr::select(humantfs_gene_name,
+                DBD,
+                ensembl_gene_id,
+                ensembl_transcript_id,
+                ipr_accession,
+                ipr_description,
+                domain_type) %>%
+  filter(!DBD %in% c("Unknown", "Excluded")) %>%
+  distinct()
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>% arrange(DBD) %>% pull(DBD) %>% unique()
+```
+
+So, there are 7 such TFs. The reason for the absence of DBD+ isoforms:
+
+1) AHRR:
+
+```{r, include=T}
+make_line_plot("AHRR", T)
+make_line_plot("AHRR", F)
+make_domain_table("AHRR", T)
+make_domain_table("AHRR", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "AHRR") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+DBD+ isoforms 515206, 504625 and 510400 that are present in GTEx were filtered out by annotation flags. On the other hand, a DBD+ isoform 652417 is not present in GTEx.
+
+2) HOXA1:
+
+```{r, include=T}
+make_line_plot("HOXA1", T)
+make_line_plot("HOXA1", F)
+make_domain_table("HOXA1", T)
+make_domain_table("HOXA1", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "HOXA1") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+A DBD+ isoform 643460 was filtered out because it does not have a TSL flag, but even if it was retained, GTEx does not have it anyway. Instead, it has an isoform ENST00000343060.4 which was present in HOXA1 annotation in Ensembl96 but then was retired and does not seem to have a successor isoform (see https://www.ensembl.org/Homo_sapiens/Transcript/Idhistory?t=ENST00000343060).
+
+3) SETBP1:
+
+```{r, include=T}
+make_line_plot("SETBP1", T)
+make_line_plot("SETBP1", F)
+make_domain_table("SETBP1", T)
+make_domain_table("SETBP1", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "SETBP1") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+The only DBD+ isoform, ENST00000649279, was filtered out because it does not have a TSL flag or the MANE Select flag. But it is not present in GTEx anyway. On the other hand, GTEx has an isoform ENST00000282030.5 which is not present in Ensembl99 but was present in Ensembl96 before it was retired with not successor (see https://www.ensembl.org/Homo_sapiens/Transcript/Idhistory?t=ENST00000282030). And this isoform is the dominant one for this TF in GTEx.
+
+4) LCORL:
+
+```{r, include=T}
+make_line_plot("LCORL", T)
+make_line_plot("LCORL", F)
+make_domain_table("LCORL", T)
+make_domain_table("LCORL", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "LCORL") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+DBD+ isoforms ENST00000382224 and ENST00000382226 were filtered out because of the TSL5 flag. But they are GENCODE basic. All the four isoforms are present in GTEx. According to RefSeq (cited in GeneCards), this TF takes part in spermatogenesis (https://www.genecards.org/cgi-bin/carddisp.pl?gene=LCORL&keywords=LCORL).
+
+5) ZNF609:
+
+```{r, include=T}
+make_line_plot("ZNF609", T)
+make_line_plot("ZNF609", F)
+make_domain_table("ZNF609", T)
+make_domain_table("ZNF609", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "ZNF609") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+The DBD+ isoform ENST00000326648 was filtered out because of the TSL5 flag. On the other hand, it's GENCODE basic and principal 1. Both isoforms are present in GTEx.
+
+6) RFX8:
+
+```{r, include=T}
+make_line_plot("RFX8", T)
+make_line_plot("RFX8", F)
+make_domain_table("RFX8", T)
+make_domain_table("RFX8", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "RFX8") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+DBD+ isoforms ENST00000646446 and ENST00000646893 were filtered out because they do not have TSL flags, but they are also absent from GTEx. Instead, GTEx has ENST00000492238.1 (non-coding, also present in the current Ensembl annotation), ENST00000484091.1 (NMD, also present in the current Ensembl annotationv) and ENST00000481179.5 (NMD, also present in the current Ensembl annotation) isoforms. So, the annotation from GTEx is outdated - it does not have the two DBD+ isoforms. Again, all the three isoforms are from the GENCODE basic set.
+
+7) ZNF81:
+
+```{r, include=T}
+make_line_plot("ZNF81", T)
+make_line_plot("ZNF81", F)
+make_domain_table("ZNF81", T)
+make_domain_table("ZNF81", F)
+gene.id = tf.family.table %>%
+  filter(humantfs_gene_name == "ZNF81") %>%
+  pull(ensembl_gene_id)
+ensg_enst_tsl %>%
+  filter(ensembl_gene_id == gene.id)
+```
+
+DBD+ isoforms ENST00000338637 and ENST00000376954 were filtered out because of their low TSLs. However, both of them are from the GENCODE basic set, and all the four isoforms are present in GTEx.
+
+## Prepare categorical sets for TF isoform expression patterns
+
+Make categorical sets out of the expression profiles of TF isoforms across tissues:
+
+```{r, include=T}
+generate.category = function(tissue.expression, n.dbd) {
+  expression.types = ifelse(tissue.expression < 1,
+                            NA,
+                            ifelse(n.dbd == 0, F, T))
+  expression.types = expression.types[!is.na(expression.types)]
+  dbd.pos.n = length(expression.types[expression.types])
+  dbd.neg.n = length(expression.types[!expression.types])
+  return(paste0(ifelse(dbd.pos.n == 0,
+                       "A",
+                       ifelse(dbd.pos.n == 1, "B", "C")),
+                ifelse(dbd.neg.n == 0,
+                       "A",
+                       ifelse(dbd.neg.n == 1, "B", "C"))))
+}
+
+isoform.expression.tf.annot = tf.ids.filtered %>%
+  left_join(isoform.expression %>%
+              tibble::rownames_to_column(),
+            by = c("ensembl_transcript_id" = "rowname")) %>%
+  left_join(base.table, 
+            by = c("ensembl_gene_id" = "ensembl_gene_id", 
+                   "ensembl_transcript_id" = "ensembl_transcript_id")) %>%
+  dplyr::select(ensembl_gene_id,
+                humantfs_gene_name,
+                ensembl_transcript_id,
+                tf_family,
+                n_dbd,
+                names(isoform.expression)) %>%
+  arrange(ensembl_gene_id, ensembl_transcript_id) %>%
+  # Filter out TFs that lost their DBD+ isoforms due to isoform filtering earlier
+  # AHRR, HOXA1, SETBP1, LCORL, ZNF609, RFX8, ZNF81
+  filter(!ensembl_gene_id %in% c("ENSG00000063438", 
+                                 "ENSG00000105991", 
+                                 "ENSG00000152217", 
+                                 "ENSG00000178177", 
+                                 "ENSG00000180357", 
+                                 "ENSG00000196460", 
+                                 "ENSG00000197779"))
+
+write.table(isoform.expression.tf.annot,
+            file = "data/results/isoform_expression_tf_annot_1.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+
+tic("Category calculation for profiles:")
+expression.profiles = bind_rows(lapply(unique(isoform.expression.tf.annot$ensembl_gene_id),
+                                       function(tf) {
+                                         tf.df = isoform.expression.tf.annot[isoform.expression.tf.annot$ensembl_gene_id == tf, ]
+                                         bind_cols(tf.df[, c(1, 2, 4)] %>%
+                                                     distinct(),
+                                                   as.data.frame(as.list(apply(tf.df[, 6:48],
+                                                                               2,
+                                                                               function(x) {
+                                                                                 generate.category(x, tf.df$n_dbd)
+                                                                               }))))
+                                       }))
+toc()
+# ~ 6 sec
+
+write.table(expression.profiles,
+            file = "data/results/expression_profiles_1.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+## Plot expression of conserved DBD- isoforms
+
+Prepare a function for making linear plots of TF isoform expression across tissues, with the option to highlight certain isoforms:
+
+```{r, include=T}
+make_line_plot_trace = function(gene.name, filtered, trace.isoforms = character()) {
+  gene.id = tf.family.table %>%
+    filter(humantfs_gene_name == gene.name) %>%
+    pull(ensembl_gene_id)
+  
+  plot.name = paste0(gene.name, "_", 
+                     gene.id, 
+                     ifelse(filtered, "_selected_isoforms", "_all_isoforms"),
+                     ".pdf")
+  
+  if (filtered) {
+    gene.id.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl %>%
+      filter(ensembl_gene_id == gene.id) %>%
+      pull(ensembl_transcript_id) %>%
+      unique()
+  } else {
+    gene.id.isoforms = tf_coding_transcripts_final_ens99_with_fam_names_corrected %>%
+      filter(ensembl_gene_id == gene.id) %>%
+      pull(ensembl_transcript_id) %>%
+      unique()
+  }
+  
+  gene.id.isoforms.expression = isoform.expression.all[rownames(isoform.expression.all) %in% gene.id.isoforms, ]
+  
+  gene.id.isoforms.expression = gene.id.isoforms.expression %>%
+    rownames_to_column("ensembl_transcript_id") %>%
+    mutate(domain_status = ifelse(ensembl_transcript_id %in% c(dbd.negative$ensembl_transcript_id,
+                                                               domainless.isoforms$ensembl_transcript_id),
+                                  "DBD-",
+                                  "DBD+")) %>%
+    mutate(domain_status = ifelse(ensembl_transcript_id %in% trace.isoforms,
+                                  ifelse(domain_status == "DBD+",
+                                         "*DBD+",
+                                         "*DBD-"),
+                                  domain_status))
+
+  gene.id.isoforms.expression.toplot = data.frame(ensembl_transcript_id = unlist(purrr::map(gene.id.isoforms.expression$ensembl_transcript_id, 
+                                                                                            function(x) {rep(x, length(tissue_names))})),
+             tissue_name = rep(tissue_names, length(gene.id.isoforms.expression$ensembl_transcript_id)),
+             transcript_count = as.numeric(paste(t(gene.id.isoforms.expression %>% 
+                                                     dplyr::select(-ensembl_transcript_id,
+                                                                   -domain_status)))),
+             domain_status = unlist(purrr::map(gene.id.isoforms.expression$domain_status, 
+                                               function(x) {rep(x, length(tissue_names))})),
+             stringsAsFactors = F)
+  
+  max.y = floor(max(gene.id.isoforms.expression.toplot$transcript_count)) + 1
+  
+  p = ggplot(data = gene.id.isoforms.expression.toplot, 
+             aes(x = tissue_name, 
+                 y = transcript_count,
+                 group = ensembl_transcript_id)) +
+      #geom_line(aes(color = ensembl_transcript_id)) +
+      geom_line(aes(color = domain_status)) +
+      geom_hline(yintercept = 1, linetype = "dashed") +
+      scale_y_discrete(limits = c(0, max.y), scales::pretty_breaks(max.y + 1)(0:max.y)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  
+  ggsave(paste0("analysis/plots/tf_isoform_expression_examples_conserved_dbdminus/", plot.name), 
+         p, 
+         width = 10,
+         height = 5,
+         device = "pdf")
+  
+  return(p)
+}
+```
+
+Make line plots for the TFs that contain the conserved DBD- isoforms found by Koustav:
+
+```{r, include=T}
+conserved.dbdminus.isoforms = c("ENST00000229387", "ENST00000256852", "ENST00000292538", "ENST00000622516", "ENST00000320583", "ENST00000340911", "ENST00000374726", "ENST00000489321", "ENST00000402136", "ENST00000421109", "ENST00000428343", "ENST00000476864", "ENST00000535034")
+
+conserved.dbdminus.genes = tf.family.table %>%
+  filter(ensembl_transcript_id %in% conserved.dbdminus.isoforms) %>%
+  pull(humantfs_gene_name) %>%
+  unique()
+
+for (gene.name in conserved.dbdminus.genes) {
+  make_line_plot_trace(gene.name, filtered = T, trace.isoforms = conserved.dbdminus.isoforms)
+}
+```
+
+CREM: The conserved DBD- isoform is the only DBD- isoform of the TF, and it is coexpressed with a dominant DBD+ isoform in the brain.
+RAX: The conserved DBD- isoform is the only DBD- isoform of the TF, and both isoforms are not expressed in adult tissues.
+CAMTA1: The conserved DBD- isoform is one of many DBD- isoforms of the TF, and not the dominant one; it is not expressed in adult tissues.
+CUX1: The two conserved DBD- isoforms are the most expressed ones in all tissues except for testis.
+ZNF655:The conserved DBD- isoform is the dominant one in nearly all tissues except for the brain.
+MYRFL: The conserved DBD- isoform is one of the two DBD- isoforms of the TF; it is not expressed in adult tissues.
+NR2F2: The conserved DBD- isoform is dominant across all tissues and is tightly coexpressed with the DBD+ one.
+RFX4: The conserved DBD- isoform is dominant in the majority of tissues where the TF is expressed, and there it is coexpressed with the DBD+ isoform (except for testis where the conserved DBD- isoform is expressed alone).
+RFX8: The conserved DBD- isoform is the only isoform of the TF but it is not expressed in adult tissues.
+THAP4: The conserved DBD- isoform is tightly coexpressed with the DBD+ one across all adult tissues.
+ZNF169: The conserved DBD- isoform is tightly coexpressed with another DBD- isoform and is almost not expressed in the brain (so the third DBD- isoform gets dominant in the brain).
+
+```{r}
+test.isoform = "ENST00000256852"
+
+tf.family.table %>%
+  filter(ensembl_transcript_id == test.isoform)
+
+isoform.expression %>% 
+  rownames_to_column("ensembl_transcript_id") %>% 
+  filter(ensembl_transcript_id == test.isoform)
+```
+
+```{r}
+setdiff(conserved.dbdminus.isoforms,
+  tf.family.table %>%
+    filter(ensembl_transcript_id %in% conserved.dbdminus.isoforms) %>%
+    pull(ensembl_transcript_id) %>%
+    unique())
+
+```

@@ -1,0 +1,160 @@
+---
+title: "Annotation of non-DBDs in alternative TF isoforms"
+author: "Sviatoslav Sidorov"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    collapsed: no
+    fig_align: center
+    fig_caption: yes
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r, include=T}
+stringsAsFactors = F
+
+library(tidyverse)
+library(kableExtra)
+```
+
+# Print package versions
+
+Print versions of the loaded libraries:
+
+```{r, include=T}
+R.version
+packageVersion("base")
+packageVersion("tidyverse")
+packageVersion("kableExtra")
+```
+
+# Read input
+
+Read args:
+
+```{r, include=T}
+args = commandArgs()
+
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl_name = args[9]
+nondbd.annot_name = args[10]
+```
+
+# Annotated and summarise non-DBDs
+
+Generate the raw table of non-DBDs:
+
+```{r, include=T}
+tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl = readRDS(tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl_name)
+
+tf.matches = tf_coding_transcripts_final_ens99_with_fam_names_corrected.with_tsl
+
+nondbd.annot.raw = tf.matches %>%
+  filter(DBD != "Excluded" & DBD != "Unknown") %>%
+  filter(is.na(represents_family)) %>%
+  filter(!is.na(ipr_accession)) %>%
+  dplyr::select(ipr_accession, ipr_description) %>%
+  distinct()
+
+write.table(nondbd.annot.raw,
+            file = "Other_domains_manually_curated_raw.tsv",
+            quote = F,
+            sep = "\t",
+            row.names = F)
+```
+
+Load the table of manually curated non-DBDs. This table was obtained by the manual curation of the table `Other_domains_manually_curated_raw.tsv` generated above:
+
+```{r, include=T}
+nondbd.annot = read.delim(nondbd.annot_name)
+```
+
+Summarise molecular functions:
+
+```{r, include=T}
+nondbd.annot.summary = nondbd.annot %>%
+  count(Molecular_function) %>%
+  arrange(desc(n))
+
+kable(nondbd.annot.summary) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%")  
+```
+
+Write down the overall stats table:
+
+```{r, include=T}
+write.table(nondbd.annot.summary, 
+            file = "Other_domains_manually_curated_summary_mol_function_dbdminus.tsv", 
+            quote = F, 
+            sep = "\t", 
+            row.names = F)
+```
+
+Summarise molecular mechanisms:
+
+```{r, include=T}
+count_mol_mechanisms = function(mol.mechanism) {
+  return(nondbd.annot %>%
+           filter(stringr::str_detect(Molecular_mechanism, fixed(mol.mechanism))) %>%
+           nrow())
+}
+
+mol_mechanism_summary = data.frame(Molecular_mechanism = unique(unlist(stringr::str_split(nondbd.annot %>%
+                                                                                            pull(Molecular_mechanism),
+                                                                                          fixed("; "))))) %>%
+  rowwise() %>%
+  mutate(n = count_mol_mechanisms(Molecular_mechanism))
+
+nondbd.type.number = nondbd.annot %>%
+  pull(ipr_accession) %>%
+  unique() %>%
+  length()
+
+mol_mechanism_summary %>%
+  mutate(frequency = n / nondbd.type.number) %>%
+  arrange(desc(n)) %>%
+  head(10) %>%
+  mutate(Molecular_mechanism = factor(Molecular_mechanism, levels = Molecular_mechanism)) %>%
+  ggplot(aes(x = Molecular_mechanism, y = frequency)) +
+    geom_col(fill = "blue") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Summarise all molecular functions of non-DBDs:
+
+```{r, include=T, fig.height=7}
+count_mol_functions = function(mol.function) {
+  return(nondbd.annot %>%
+           filter(stringr::str_detect(Molecular_function, fixed(mol.function))) %>%
+           nrow())
+}
+
+mol_function_summary = data.frame(Molecular_function = unique(unlist(stringr::str_split(nondbd.annot %>%
+                                                                                          pull(Molecular_function),
+                                                                                        fixed("; "))))) %>%
+  rowwise() %>%
+  mutate(n = count_mol_functions(Molecular_function))
+
+nondbd.type.number = nondbd.annot %>%
+  pull(ipr_accession) %>%
+  unique() %>%
+  length()
+
+mol_function_summary %>%
+  mutate(frequency = n / nondbd.type.number) %>%
+  arrange(desc(n)) %>%
+  head(10) %>%
+  mutate(Molecular_function = factor(Molecular_function, levels = Molecular_function)) %>%
+  ggplot(aes(x = Molecular_function, y = frequency)) +
+    geom_col(fill = "red") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+This plot shows the most popular non-DBD types (including non-canonical DBDs).
